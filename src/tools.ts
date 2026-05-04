@@ -104,6 +104,15 @@ interface ToolUpdate {
   };
 }
 
+type AskUserQuestionInput = {
+  questions?: Array<{
+    question?: string;
+    header?: string;
+    options?: Array<{ label?: string; description?: string; preview?: string }>;
+    multiSelect?: boolean;
+  }>;
+};
+
 /**
  * Convert an absolute file path to a project-relative path for display.
  * Returns the original path if it's outside the project directory or if no cwd is provided.
@@ -374,6 +383,49 @@ export function toolInfoFromToolUse(
         kind: "switch_mode",
         content: planInput?.plan
           ? [{ type: "content" as const, content: { type: "text" as const, text: planInput.plan } }]
+          : [],
+      };
+    }
+
+    case "AskUserQuestion": {
+      const input = toolUse.input as AskUserQuestionInput | undefined;
+      const questions = Array.isArray(input?.questions) ? input.questions : [];
+      const title = questions[0]?.question ? questions[0].question : "Answer question";
+      const text = questions
+        .map((question, index) => {
+          const options = Array.isArray(question.options) ? question.options : [];
+          const optionText = options
+            .map((option) =>
+              option.label && option.description
+                ? `- ${option.label}: ${option.description}`
+                : option.label
+                  ? `- ${option.label}`
+                  : null,
+            )
+            .filter(Boolean)
+            .join("\n");
+          const mode = question.multiSelect ? "Multiple selections allowed" : "Choose one option";
+          return [
+            `${index + 1}. ${question.question ?? "Question"}`,
+            mode,
+            optionText,
+            "Custom answer is supported.",
+          ]
+            .filter(Boolean)
+            .join("\n");
+        })
+        .join("\n\n");
+
+      return {
+        title,
+        kind: "think",
+        content: text
+          ? [
+              {
+                type: "content" as const,
+                content: { type: "text" as const, text },
+              },
+            ]
           : [],
       };
     }

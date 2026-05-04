@@ -119,6 +119,23 @@ type UsageSnapshot = {
   cache_creation_input_tokens: number;
 };
 
+type AskUserQuestionOption = {
+  label: string;
+  description: string;
+  preview?: string;
+};
+
+type AskUserQuestion = {
+  question: string;
+  header: string;
+  options: AskUserQuestionOption[];
+  multiSelect: boolean;
+};
+
+type AskUserQuestionInput = {
+  questions: AskUserQuestion[];
+};
+
 const ZERO_USAGE = Object.freeze({
   input_tokens: 0,
   output_tokens: 0,
@@ -440,6 +457,131 @@ export function describeAlwaysAllow(
   return `Always Allow ${parts.join(" and ")}`;
 }
 
+function supportsAskUserQuestion(clientCapabilities?: ClientCapabilities): boolean {
+  const claudeCode = (clientCapabilities?._meta as any)?.claudeCode;
+  const capability = claudeCode?.askUserQuestion;
+  return capability === true || capability?.enabled === true;
+}
+
+function resolveBuiltInTools(options: {
+  userProvidedTools: Options["tools"] | undefined;
+  disableBuiltInTools: boolean;
+  supportsAskUserQuestion: boolean;
+}): Options["tools"] {
+  if (options.userProvidedTools !== undefined) {
+    return options.userProvidedTools;
+  }
+
+  if (options.disableBuiltInTools) {
+    return [];
+  }
+
+  if (options.supportsAskUserQuestion) {
+    // The SDK preset serializes to `--tools default`, which does not expose
+    // AskUserQuestion. The CLI accepts `default,AskUserQuestion`, preserving
+    // future default tools while adding the ACP-backed question tool.
+    return ["default", "AskUserQuestion"];
+  }
+
+  return { type: "preset", preset: "claude_code" };
+}
+
+function parseAskUserQuestionInput(input: unknown): AskUserQuestionInput | null {
+  if (!input || typeof input !== "object" || !Array.isArray((input as any).questions)) {
+    return null;
+  }
+
+  const questions: AskUserQuestion[] = [];
+  for (const question of (input as any).questions) {
+    if (
+      !question ||
+      typeof question !== "object" ||
+      typeof question.question !== "string" ||
+      typeof question.header !== "string" ||
+      !Array.isArray(question.options)
+    ) {
+      return null;
+    }
+
+    const options: AskUserQuestionOption[] = [];
+    for (const option of question.options) {
+      if (
+        !option ||
+        typeof option !== "object" ||
+        typeof option.label !== "string" ||
+        typeof option.description !== "string"
+      ) {
+        return null;
+      }
+      options.push({
+        label: option.label,
+        description: option.description,
+        ...(typeof option.preview === "string" ? { preview: option.preview } : {}),
+      });
+    }
+
+    questions.push({
+      question: question.question,
+      header: question.header,
+      options,
+      multiSelect: question.multiSelect === true,
+    });
+  }
+
+  return { questions };
+}
+
+function getAskUserQuestionMeta(value: unknown): unknown {
+  return (value as any)?.claudeCode?.askUserQuestion;
+}
+
+function getAskUserQuestionAnswerPayload(response: unknown): unknown {
+  return (
+    getAskUserQuestionMeta((response as any)?.outcome?._meta) ??
+    getAskUserQuestionMeta((response as any)?._meta)
+  );
+}
+
+function normalizeAnswerValue(value: unknown): string | null {
+  if (typeof value === "string") {
+    const answer = value.trim();
+    return answer.length > 0 ? answer : null;
+  }
+  if (Array.isArray(value) && value.every((entry) => typeof entry === "string")) {
+    const answer = value.map((entry) => entry.trim()).filter(Boolean).join(", ");
+    return answer.length > 0 ? answer : null;
+  }
+  return null;
+}
+
+function parseAskUserQuestionAnswers(
+  questions: AskUserQuestion[],
+  response: unknown,
+): Record<string, string> | null {
+  const payload = getAskUserQuestionAnswerPayload(response);
+  if (!payload || typeof payload !== "object") return null;
+
+  const rawAnswers = (payload as any).answers;
+  if (rawAnswers && typeof rawAnswers === "object" && !Array.isArray(rawAnswers)) {
+    const answers: Record<string, string> = {};
+    for (const [index, question] of questions.entries()) {
+      const rawAnswer =
+        rawAnswers[question.question] ?? rawAnswers[question.header] ?? rawAnswers[String(index)];
+      const answer = normalizeAnswerValue(rawAnswer);
+      if (!answer) return null;
+      answers[question.question] = answer;
+    }
+    return answers;
+  }
+
+  if (questions.length === 1) {
+    const answer = normalizeAnswerValue((payload as any).answer);
+    return answer ? { [questions[0].question]: answer } : null;
+  }
+
+  return null;
+}
+
 // Implement the ACP Agent interface
 export class ClaudeAcpAgent implements Agent {
   sessions: {
@@ -564,6 +706,7 @@ export class ClaudeAcpAgent implements Agent {
         _meta: {
           claudeCode: {
             promptQueueing: true,
+            askUserQuestion: true,
           },
         },
         promptCapabilities: {
@@ -1388,6 +1531,71 @@ export class ClaudeAcpAgent implements Agent {
     return response;
   }
 
+  private async askUserQuestion(
+    sessionId: string,
+    toolInput: unknown,
+    signal: AbortSignal,
+    toolUseID: string,
+  ) {
+    const input = parseAskUserQuestionInput(toolInput);
+    if (!input || input.questions.length === 0) {
+      return {
+        behavior: "deny" as const,
+        message: "Invalid AskUserQuestion input",
+      };
+    }
+
+    const response = await this.client.requestPermission({
+      options: [
+        { kind: "allow_once", name: "Submit answers", optionId: "answer" },
+        { kind: "reject_once", name: "Cancel", optionId: "cancel" },
+      ],
+      sessionId,
+      toolCall: {
+        toolCallId: toolUseID,
+        rawInput: toolInput,
+        ...toolInfoFromToolUse({ name: "AskUserQuestion", input, id: toolUseID }),
+      },
+      _meta: {
+        claudeCode: {
+          requestType: "askUserQuestion",
+          askUserQuestion: {
+            version: 1,
+            allowCustomAnswer: true,
+            questions: input.questions,
+          },
+        },
+      },
+    });
+
+    if (signal.aborted || response.outcome?.outcome === "cancelled") {
+      throw new Error("Tool use aborted");
+    }
+
+    if (response.outcome?.outcome !== "selected" || response.outcome.optionId !== "answer") {
+      return {
+        behavior: "deny" as const,
+        message: "User cancelled the question.",
+      };
+    }
+
+    const answers = parseAskUserQuestionAnswers(input.questions, response);
+    if (!answers) {
+      return {
+        behavior: "deny" as const,
+        message: "User did not provide valid answers.",
+      };
+    }
+
+    return {
+      behavior: "allow" as const,
+      updatedInput: {
+        questions: input.questions,
+        answers,
+      },
+    };
+  }
+
   canUseTool(sessionId: string): CanUseTool {
     return async (toolName, toolInput, { signal, suggestions, toolUseID }) => {
       const alwaysAllowLabel = describeAlwaysAllow(suggestions, toolName);
@@ -1398,6 +1606,10 @@ export class ClaudeAcpAgent implements Agent {
           behavior: "deny",
           message: "Session not found",
         };
+      }
+
+      if (toolName === "AskUserQuestion") {
+        return this.askUserQuestion(sessionId, toolInput, signal, toolUseID);
       }
 
       if (toolName === "ExitPlanMode") {
@@ -1745,16 +1957,18 @@ export class ClaudeAcpAgent implements Agent {
     // Parse model configuration from environment (e.g. Bedrock model overrides)
     const modelConfig = parseModelConfig(process.env.CLAUDE_MODEL_CONFIG);
 
-    // Disable this for now, not a great way to expose this over ACP at the moment (in progress work so we can revisit)
-    const disallowedTools = ["AskUserQuestion"];
+    const canAskUserQuestion = supportsAskUserQuestion(this.clientCapabilities);
+    const disallowedTools = canAskUserQuestion ? [] : ["AskUserQuestion"];
 
     // Resolve which built-in tools to expose.
     // Explicit tools array from _meta.claudeCode.options takes precedence.
     // disableBuiltInTools is a legacy shorthand for tools: [] — kept for
     // backward compatibility but callers should prefer the tools array.
-    const tools: Options["tools"] =
-      userProvidedOptions?.tools ??
-      (params._meta?.disableBuiltInTools === true ? [] : { type: "preset", preset: "claude_code" });
+    const tools = resolveBuiltInTools({
+      userProvidedTools: userProvidedOptions?.tools,
+      disableBuiltInTools: params._meta?.disableBuiltInTools === true,
+      supportsAskUserQuestion: canAskUserQuestion,
+    });
 
     const abortController = userProvidedOptions?.abortController || new AbortController();
 

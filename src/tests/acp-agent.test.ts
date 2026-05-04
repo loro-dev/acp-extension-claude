@@ -1336,6 +1336,27 @@ describe("permission requests", () => {
         },
         expectedTitlePart: "/test/data.json",
       },
+      {
+        toolUse: {
+          type: "tool_use" as const,
+          id: "test-4",
+          name: "AskUserQuestion",
+          input: {
+            questions: [
+              {
+                question: "Which database should we use?",
+                header: "Database",
+                options: [
+                  { label: "Postgres", description: "Use PostgreSQL" },
+                  { label: "SQLite", description: "Use SQLite" },
+                ],
+                multiSelect: false,
+              },
+            ],
+          },
+        },
+        expectedTitlePart: "Which database should we use?",
+      },
     ];
 
     for (const testCase of testCases) {
@@ -1442,6 +1463,184 @@ describe("permission requests", () => {
         "Bash",
       );
       expect(label).toBe("Always Allow all Bash");
+    });
+  });
+
+  function createAskUserQuestionAgent(
+    requestPermission: AgentSideConnection["requestPermission"],
+    mode: string = "default",
+  ) {
+    const mockClient = {
+      requestPermission,
+      sessionUpdate: async () => { },
+      extMethod: async () => { },
+    } as unknown as AgentSideConnection;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => { }, error: () => { } });
+    agent.clientCapabilities = { _meta: { claudeCode: { askUserQuestion: true } } } as any;
+    agent.sessions["test-session"] = {
+      modes: { currentModeId: mode, availableModes: [] },
+      cwd: "/test",
+    } as any;
+    return agent;
+  }
+
+  const askUserQuestionInput = {
+    questions: [
+      {
+        question: "Which database should we use?",
+        header: "Database",
+        options: [
+          { label: "Postgres", description: "Use PostgreSQL" },
+          { label: "SQLite", description: "Use SQLite" },
+        ],
+        multiSelect: false,
+      },
+      {
+        question: "Which constraints matter?",
+        header: "Constraints",
+        options: [
+          { label: "Docker", description: "Must run in Docker" },
+          { label: "Offline", description: "Must work offline" },
+        ],
+        multiSelect: true,
+      },
+    ],
+  };
+
+  it("routes AskUserQuestion through ACP permission metadata and returns answers", async () => {
+    let request: RequestPermissionRequest | undefined;
+    const agent = createAskUserQuestionAgent(async (params) => {
+      request = params;
+      return {
+        outcome: {
+          outcome: "selected",
+          optionId: "answer",
+          _meta: {
+            claudeCode: {
+              askUserQuestion: {
+                answers: {
+                  "Which database should we use?": "Postgres",
+                  Constraints: ["Docker", "Offline"],
+                },
+              },
+            },
+          },
+        },
+      } as any;
+    });
+
+    const result = await agent.canUseTool("test-session")("AskUserQuestion", askUserQuestionInput, {
+      signal: new AbortController().signal,
+      suggestions: undefined,
+      toolUseID: "toolu_ask",
+    } as any);
+
+    expect((request as any)?._meta).toEqual({
+      claudeCode: {
+        requestType: "askUserQuestion",
+        askUserQuestion: {
+          version: 1,
+          allowCustomAnswer: true,
+          questions: askUserQuestionInput.questions,
+        },
+      },
+    });
+    expect((request as any)?.toolCall.title).toBe("Which database should we use?");
+    expect(result).toEqual({
+      behavior: "allow",
+      updatedInput: {
+        questions: askUserQuestionInput.questions,
+        answers: {
+          "Which database should we use?": "Postgres",
+          "Which constraints matter?": "Docker, Offline",
+        },
+      },
+    });
+  });
+
+  it("accepts a custom free-text AskUserQuestion answer", async () => {
+    const agent = createAskUserQuestionAgent(async () => ({
+      outcome: {
+        outcome: "selected",
+        optionId: "answer",
+        _meta: {
+          claudeCode: {
+            askUserQuestion: {
+              answer: "Use Turso because it has edge replication",
+            },
+          },
+        },
+      },
+    } as any));
+
+    const singleQuestionInput = { questions: [askUserQuestionInput.questions[0]] };
+    const result = await agent.canUseTool("test-session")("AskUserQuestion", singleQuestionInput, {
+      signal: new AbortController().signal,
+      suggestions: undefined,
+      toolUseID: "toolu_ask",
+    } as any);
+
+    expect(result).toEqual({
+      behavior: "allow",
+      updatedInput: {
+        questions: singleQuestionInput.questions,
+        answers: {
+          "Which database should we use?": "Use Turso because it has edge replication",
+        },
+      },
+    });
+  });
+
+  it("still asks AskUserQuestion in bypassPermissions mode", async () => {
+    let requestCount = 0;
+    const agent = createAskUserQuestionAgent(async () => {
+      requestCount++;
+      return {
+        outcome: {
+          outcome: "selected",
+          optionId: "answer",
+          _meta: {
+            claudeCode: {
+              askUserQuestion: {
+                answer: "Use Postgres",
+              },
+            },
+          },
+        },
+      } as any;
+    }, "bypassPermissions");
+
+    const result = await agent.canUseTool("test-session")(
+      "AskUserQuestion",
+      { questions: [askUserQuestionInput.questions[0]] },
+      {
+        signal: new AbortController().signal,
+        suggestions: undefined,
+        toolUseID: "toolu_ask",
+      } as any,
+    );
+
+    expect(requestCount).toBe(1);
+    expect(result.behavior).toBe("allow");
+  });
+
+  it("denies AskUserQuestion when the client does not return answers", async () => {
+    const agent = createAskUserQuestionAgent(async () => ({
+      outcome: {
+        outcome: "selected",
+        optionId: "answer",
+      },
+    } as any));
+
+    const result = await agent.canUseTool("test-session")("AskUserQuestion", askUserQuestionInput, {
+      signal: new AbortController().signal,
+      suggestions: undefined,
+      toolUseID: "toolu_ask",
+    } as any);
+
+    expect(result).toEqual({
+      behavior: "deny",
+      message: "User did not provide valid answers.",
     });
   });
 });

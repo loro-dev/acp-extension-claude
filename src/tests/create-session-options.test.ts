@@ -86,6 +86,54 @@ describe("createSession options merging", () => {
     expect(capturedOptions!.disallowedTools).toContain("AskUserQuestion");
   });
 
+  it("allows AskUserQuestion when the client advertises ACP question support", async () => {
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        _meta: {
+          claudeCode: {
+            askUserQuestion: true,
+          },
+        },
+      },
+    } as any);
+
+    await agent.newSession({
+      cwd: "/test",
+      mcpServers: [],
+    });
+
+    expect(capturedOptions!.disallowedTools).not.toContain("AskUserQuestion");
+    expect(capturedOptions!.tools).toEqual(["default", "AskUserQuestion"]);
+  });
+
+  it("still honors user-disallowed AskUserQuestion when the client supports questions", async () => {
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        _meta: {
+          claudeCode: {
+            askUserQuestion: true,
+          },
+        },
+      },
+    } as any);
+
+    await agent.newSession({
+      cwd: "/test",
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: {
+            disallowedTools: ["AskUserQuestion"],
+          },
+        },
+      },
+    });
+
+    expect(capturedOptions!.disallowedTools).toContain("AskUserQuestion");
+  });
+
   it("works when user provides empty disallowedTools", async () => {
     await agent.newSession({
       cwd: "/test",
@@ -205,6 +253,33 @@ describe("createSession options merging", () => {
   });
 
   it("passes through user-provided tools string array", async () => {
+    await agent.newSession({
+      cwd: "/test",
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: {
+            tools: ["Read", "Glob"],
+          },
+        },
+      },
+    });
+
+    expect(capturedOptions!.tools).toEqual(["Read", "Glob"]);
+  });
+
+  it("keeps user-provided tools when AskUserQuestion is supported", async () => {
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        _meta: {
+          claudeCode: {
+            askUserQuestion: true,
+          },
+        },
+      },
+    } as any);
+
     await agent.newSession({
       cwd: "/test",
       mcpServers: [],

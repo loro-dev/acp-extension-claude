@@ -52,6 +52,24 @@ describe("authorization", () => {
     );
   });
 
+  it("advertises AskUserQuestion ACP extension support", async () => {
+    const [agent] = await createAgentMock();
+
+    const initializeResponse = await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {},
+    });
+
+    const agentCapabilities = initializeResponse.agentCapabilities;
+    if (!agentCapabilities) {
+      throw new Error("Expected initialize response to include agent capabilities");
+    }
+
+    expect((agentCapabilities._meta as any)?.claudeCode).toMatchObject({
+      askUserQuestion: true,
+    });
+  });
+
   it("gateway auth offered when client advertises auth._meta.gateway capability", async () => {
     const [agent] = await createAgentMock();
 
