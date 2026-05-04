@@ -463,6 +463,29 @@ function supportsAskUserQuestion(clientCapabilities?: ClientCapabilities): boole
   return capability === true || capability?.enabled === true;
 }
 
+function resolveBuiltInTools(options: {
+  userProvidedTools: Options["tools"] | undefined;
+  disableBuiltInTools: boolean;
+  supportsAskUserQuestion: boolean;
+}): Options["tools"] {
+  if (options.userProvidedTools !== undefined) {
+    return options.userProvidedTools;
+  }
+
+  if (options.disableBuiltInTools) {
+    return [];
+  }
+
+  if (options.supportsAskUserQuestion) {
+    // The SDK preset serializes to `--tools default`, which does not expose
+    // AskUserQuestion. The CLI accepts `default,AskUserQuestion`, preserving
+    // future default tools while adding the ACP-backed question tool.
+    return ["default", "AskUserQuestion"];
+  }
+
+  return { type: "preset", preset: "claude_code" };
+}
+
 function parseAskUserQuestionInput(input: unknown): AskUserQuestionInput | null {
   if (!input || typeof input !== "object" || !Array.isArray((input as any).questions)) {
     return null;
@@ -1934,17 +1957,18 @@ export class ClaudeAcpAgent implements Agent {
     // Parse model configuration from environment (e.g. Bedrock model overrides)
     const modelConfig = parseModelConfig(process.env.CLAUDE_MODEL_CONFIG);
 
-    const disallowedTools = supportsAskUserQuestion(this.clientCapabilities)
-      ? []
-      : ["AskUserQuestion"];
+    const canAskUserQuestion = supportsAskUserQuestion(this.clientCapabilities);
+    const disallowedTools = canAskUserQuestion ? [] : ["AskUserQuestion"];
 
     // Resolve which built-in tools to expose.
     // Explicit tools array from _meta.claudeCode.options takes precedence.
     // disableBuiltInTools is a legacy shorthand for tools: [] — kept for
     // backward compatibility but callers should prefer the tools array.
-    const tools: Options["tools"] =
-      userProvidedOptions?.tools ??
-      (params._meta?.disableBuiltInTools === true ? [] : { type: "preset", preset: "claude_code" });
+    const tools = resolveBuiltInTools({
+      userProvidedTools: userProvidedOptions?.tools,
+      disableBuiltInTools: params._meta?.disableBuiltInTools === true,
+      supportsAskUserQuestion: canAskUserQuestion,
+    });
 
     const abortController = userProvidedOptions?.abortController || new AbortController();
 

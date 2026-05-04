@@ -60,7 +60,12 @@ describe("authorization", () => {
       clientCapabilities: {},
     });
 
-    expect((initializeResponse.agentCapabilities._meta as any)?.claudeCode).toMatchObject({
+    const agentCapabilities = initializeResponse.agentCapabilities;
+    if (!agentCapabilities) {
+      throw new Error("Expected initialize response to include agent capabilities");
+    }
+
+    expect((agentCapabilities._meta as any)?.claudeCode).toMatchObject({
       askUserQuestion: true,
     });
   });
