@@ -1,6 +1,6 @@
 {
   "name": "acp-extension-claude",
-  "version": "0.34.1",
+  "version": "0.34.2",
   "description": "Forked ACP-compatible coding agent with improved timeout handling and logging",
   "main": "dist/lib.js",
   "types": "dist/lib.d.ts",
