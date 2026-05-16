@@ -3447,6 +3447,7 @@ describe("result origin handling", () => {
       sessionUpdate: async (notification: any) => {
         updates.push(notification);
       },
+      extMethod: async () => {},
     } as unknown as AgentSideConnection;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
     return { agent, updates };
