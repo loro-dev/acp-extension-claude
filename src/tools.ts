@@ -792,61 +792,18 @@ export function toolUpdateFromDiffToolResponse(toolResponse: unknown): {
   return result;
 }
 
-const HOOK_DIAGNOSTIC_SAMPLE_LIMIT = 5;
-
-function isHookTraceEnabled(): boolean {
-  const value = process.env.CLAUDE_ACP_HOOK_TRACE?.toLowerCase();
-  return value === "1" || value === "true" || value === "yes";
-}
-
 type ToolUseCallbackEntry = {
   onPostToolUseHook?: (
     toolUseID: string,
     toolInput: unknown,
     toolResponse: unknown,
   ) => Promise<void>;
-  registeredAtMs: number;
-  toolName?: string;
-};
-
-export type HookCallbackDiagnostics = {
-  registeredCount: number;
-  sample: Array<{ toolUseId: string; ageMs: number; toolName?: string }>;
 };
 
 /* A global variable to store callbacks that should be executed when receiving hooks from Claude Code */
 const toolUseCallbacks: {
   [toolUseId: string]: ToolUseCallbackEntry;
 } = {};
-
-export function getHookCallbackDiagnostics(nowMs = Date.now()): HookCallbackDiagnostics {
-  const entries = Object.entries(toolUseCallbacks)
-    .map(([toolUseId, entry]) => ({
-      toolUseId,
-      ageMs: Math.max(0, nowMs - entry.registeredAtMs),
-      toolName: entry.toolName,
-    }))
-    .sort((a, b) => b.ageMs - a.ageMs);
-
-  return {
-    registeredCount: entries.length,
-    sample: entries.slice(0, HOOK_DIAGNOSTIC_SAMPLE_LIMIT),
-  };
-}
-
-function formatHookCallbackDiagnostics(nowMs = Date.now()): string {
-  const diagnostics = getHookCallbackDiagnostics(nowMs);
-  const sample =
-    diagnostics.sample.length === 0
-      ? "none"
-      : diagnostics.sample
-          .map((entry) => {
-            const toolName = entry.toolName ? `:${entry.toolName}` : "";
-            return `${entry.toolUseId}${toolName}:${Math.round(entry.ageMs / 1000)}s`;
-          })
-          .join(",");
-  return `registered=${diagnostics.registeredCount}; sample=${sample}`;
-}
 
 /* Setup callbacks that will be called when receiving hooks from Claude Code */
 export const registerHookCallback = (
@@ -860,34 +817,10 @@ export const registerHookCallback = (
       toolResponse: unknown,
     ) => Promise<void>;
   },
-  options?: {
-    logger?: Logger;
-    toolName?: string;
-    sessionId?: string;
-  },
 ) => {
-  const previous = toolUseCallbacks[toolUseID];
-  if (previous && options?.logger) {
-    options.logger.error(
-      `[claude-agent-acp] Replacing PostToolUse hook callback for tool use ${toolUseID}${
-        options.toolName ? ` (${options.toolName})` : ""
-      } after ${Math.round((Date.now() - previous.registeredAtMs) / 1000)}s${
-        options.sessionId ? ` session=${options.sessionId}` : ""
-      }`,
-    );
-  }
   toolUseCallbacks[toolUseID] = {
     onPostToolUseHook,
-    registeredAtMs: Date.now(),
-    toolName: options?.toolName,
   };
-  if (options?.logger && isHookTraceEnabled()) {
-    options.logger.error(
-      `[claude-agent-acp] Registered PostToolUse hook callback for ${toolUseID}${
-        options.toolName ? ` (${options.toolName})` : ""
-      }${options.sessionId ? ` session=${options.sessionId}` : ""}; ${formatHookCallbackDiagnostics()}`,
-    );
-  }
 };
 
 /* A callback for Claude Code that is called when receiving a PostToolUse hook */
@@ -908,22 +841,10 @@ export const createPostToolUseHook =
       if (toolUseID) {
         const onPostToolUseHook = toolUseCallbacks[toolUseID]?.onPostToolUseHook;
         if (onPostToolUseHook) {
-          if (isHookTraceEnabled()) {
-            logger.error(
-              `[claude-agent-acp] Running PostToolUse hook callback for ${toolUseID} (${input.tool_name ?? "unknown"})`,
-            );
-          }
           await onPostToolUseHook(toolUseID, input.tool_input, input.tool_response);
           delete toolUseCallbacks[toolUseID]; // Cleanup after execution
-          if (isHookTraceEnabled()) {
-            logger.error(
-              `[claude-agent-acp] Completed PostToolUse hook callback for ${toolUseID} (${input.tool_name ?? "unknown"}); ${formatHookCallbackDiagnostics()}`,
-            );
-          }
         } else {
-          logger.error(
-            `[claude-agent-acp] No onPostToolUseHook found for tool use ID: ${toolUseID} (${input.tool_name ?? "unknown"}); ${formatHookCallbackDiagnostics()}`,
-          );
+          logger.error(`No onPostToolUseHook found for tool use ID: ${toolUseID}`);
           delete toolUseCallbacks[toolUseID];
         }
       }
