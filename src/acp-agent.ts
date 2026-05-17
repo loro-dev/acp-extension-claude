@@ -71,7 +71,6 @@ import { SettingsManager } from "./settings.js";
 import {
   ClaudePlanEntry,
   createPostToolUseHook,
-  getHookCallbackDiagnostics,
   planEntries,
   registerHookCallback,
   toolInfoFromToolUse,
@@ -90,95 +89,7 @@ export const CLAUDE_CONFIG_DIR =
   process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
 
 const MAX_TITLE_LENGTH = 256;
-const PROMPT_DIAGNOSTIC_WAIT_WARN_AFTER_MS = 120_000;
-const PROMPT_DIAGNOSTIC_WAIT_WARN_INTERVAL_MS = 300_000;
-
-type PromptDiagnostics = {
-  promptId: string;
-  startedAtMs: number;
-  lastSdkMessageAtMs: number;
-  lastSdkMessageSummary: string;
-  sdkMessageCount: number;
-  resultMessageCount: number;
-  idleStateCount: number;
-  streamEventCount: number;
-  assistantMessageCount: number;
-  userMessageCount: number;
-};
-
-function isPromptTraceEnabled(): boolean {
-  const value = process.env.CLAUDE_ACP_PROMPT_TRACE?.toLowerCase();
-  return value === "1" || value === "true" || value === "yes";
-}
-
-function safeStringField(value: unknown): string | null {
-  return typeof value === "string" && value.length > 0 ? value : null;
-}
-
-function safeRecord(value: unknown): Record<string, unknown> | null {
-  return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : null;
-}
-
-function summarizeSdkMessage(message: unknown): string {
-  const record = safeRecord(message);
-  if (!record) return "non-object";
-
-  const type = safeStringField(record.type) ?? "unknown";
-  const subtype = safeStringField(record.subtype);
-  const parts = [`type=${type}`];
-  if (subtype) parts.push(`subtype=${subtype}`);
-
-  if (type === "system") {
-    const state = safeStringField(record.state);
-    const status = safeStringField(record.status);
-    if (state) parts.push(`state=${state}`);
-    if (status) parts.push(`status=${status}`);
-  }
-
-  if (type === "result") {
-    const stopReason = safeStringField(record.stop_reason) ?? safeStringField(record.stopReason);
-    const origin = safeRecord(record.origin);
-    const originKind = origin ? safeStringField(origin.kind) : null;
-    if (stopReason) parts.push(`stopReason=${stopReason}`);
-    if (originKind) parts.push(`origin=${originKind}`);
-    if (typeof record.is_error === "boolean") parts.push(`isError=${record.is_error}`);
-  }
-
-  if (type === "stream_event") {
-    const event = safeRecord(record.event);
-    const eventType = event ? safeStringField(event.type) : null;
-    if (eventType) parts.push(`event=${eventType}`);
-  }
-
-  const parentToolUseId = safeStringField(record.parent_tool_use_id);
-  if (parentToolUseId) parts.push(`parentToolUseId=${parentToolUseId}`);
-
-  return parts.join(",");
-}
-
-function updatePromptDiagnosticsFromSdkMessage(
-  diagnostics: PromptDiagnostics,
-  message: unknown,
-  nowMs: number,
-): void {
-  diagnostics.lastSdkMessageAtMs = nowMs;
-  diagnostics.lastSdkMessageSummary = summarizeSdkMessage(message);
-  diagnostics.sdkMessageCount += 1;
-
-  const record = safeRecord(message);
-  const type = safeStringField(record?.type);
-  if (type === "result") diagnostics.resultMessageCount += 1;
-  if (type === "stream_event") diagnostics.streamEventCount += 1;
-  if (type === "assistant") diagnostics.assistantMessageCount += 1;
-  if (type === "user") diagnostics.userMessageCount += 1;
-  if (
-    type === "system" &&
-    safeStringField(record?.subtype) === "session_state_changed" &&
-    safeStringField(record?.state) === "idle"
-  ) {
-    diagnostics.idleStateCount += 1;
-  }
-}
+const PROMPT_TERMINAL_RESULT_IDLE_GRACE_MS = 5_000;
 
 function sanitizeTitle(text: string): string {
   // Replace newlines and collapse whitespace
@@ -242,6 +153,7 @@ const DEFAULT_CONTEXT_WINDOW = 200000;
 
 type Session = {
   query: Query;
+  pendingQueryNext?: Promise<Awaited<ReturnType<Query["next"]>>>;
   input: Pushable<SDKUserMessage>;
   cancelled: boolean;
   cwd: string;
@@ -267,43 +179,6 @@ type Session = {
   contextWindowSize: number;
 };
 
-function formatPromptDiagnostics(
-  session: Session,
-  diagnostics: PromptDiagnostics,
-  nowMs: number,
-): string {
-  const elapsedSeconds = Math.round((nowMs - diagnostics.startedAtMs) / 1000);
-  const lastSdkMessageSeconds = Math.round((nowMs - diagnostics.lastSdkMessageAtMs) / 1000);
-  const hooks = getHookCallbackDiagnostics(nowMs);
-  const hookSample =
-    hooks.sample.length === 0
-      ? "none"
-      : hooks.sample
-          .map((entry) => {
-            const toolName = entry.toolName ? `:${entry.toolName}` : "";
-            return `${entry.toolUseId}${toolName}:${Math.round(entry.ageMs / 1000)}s`;
-          })
-          .join(",");
-
-  return [
-    `promptId=${diagnostics.promptId}`,
-    `elapsed=${elapsedSeconds}s`,
-    `sinceLastSdkMessage=${lastSdkMessageSeconds}s`,
-    `lastSdkMessage=${diagnostics.lastSdkMessageSummary}`,
-    `sdkMessages=${diagnostics.sdkMessageCount}`,
-    `results=${diagnostics.resultMessageCount}`,
-    `idleStates=${diagnostics.idleStateCount}`,
-    `streamEvents=${diagnostics.streamEventCount}`,
-    `assistantMessages=${diagnostics.assistantMessageCount}`,
-    `userMessages=${diagnostics.userMessageCount}`,
-    `promptRunning=${session.promptRunning}`,
-    `pendingMessages=${session.pendingMessages.size}`,
-    `cancelled=${session.cancelled}`,
-    `registeredHooks=${hooks.registeredCount}`,
-    `hookSample=${hookSample}`,
-  ].join("; ");
-}
-
 /** Compute a stable fingerprint of the session-defining params so we can
  *  detect when a loadSession/resumeSession call requires tearing down and
  *  recreating the underlying Query process.  MCP servers are sorted by name
@@ -318,14 +193,14 @@ function computeSessionFingerprint(params: {
 
 type BackgroundTerminal =
   | {
-    handle: TerminalHandle;
-    status: "started";
-    lastOutput: TerminalOutputResponse | null;
-  }
+      handle: TerminalHandle;
+      status: "started";
+      lastOutput: TerminalOutputResponse | null;
+    }
   | {
-    status: "aborted" | "exited" | "killed" | "timedOut";
-    pendingOutput: TerminalOutputResponse;
-  };
+      status: "aborted" | "exited" | "killed" | "timedOut";
+      pendingOutput: TerminalOutputResponse;
+    };
 
 export type SDKMessageFilter = {
   type: string;
@@ -701,7 +576,10 @@ function normalizeAnswerValue(value: unknown): string | null {
     return answer.length > 0 ? answer : null;
   }
   if (Array.isArray(value) && value.every((entry) => typeof entry === "string")) {
-    const answer = value.map((entry) => entry.trim()).filter(Boolean).join(", ");
+    const answer = value
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+      .join(", ");
     return answer.length > 0 ? answer : null;
   }
   return null;
@@ -1010,34 +888,6 @@ export class ClaudeAcpAgent implements Agent {
 
     const promptUuid = randomUUID();
     userMessage.uuid = promptUuid;
-    const promptDiagnostics: PromptDiagnostics = {
-      promptId: promptUuid,
-      startedAtMs: Date.now(),
-      lastSdkMessageAtMs: Date.now(),
-      lastSdkMessageSummary: "none",
-      sdkMessageCount: 0,
-      resultMessageCount: 0,
-      idleStateCount: 0,
-      streamEventCount: 0,
-      assistantMessageCount: 0,
-      userMessageCount: 0,
-    };
-    const tracePrompt = isPromptTraceEnabled();
-    let promptWaitWarningLogged = false;
-    let lastPromptWaitWarningAtMs =
-      promptDiagnostics.startedAtMs -
-      PROMPT_DIAGNOSTIC_WAIT_WARN_INTERVAL_MS +
-      PROMPT_DIAGNOSTIC_WAIT_WARN_AFTER_MS;
-    const logPromptTrace = (message: string) => {
-      if (!tracePrompt) return;
-      this.logger.error(
-        `[claude-agent-acp] ${message}; session=${params.sessionId}; ${formatPromptDiagnostics(
-          session,
-          promptDiagnostics,
-          Date.now(),
-        )}`,
-      );
-    };
 
     // These local-only commands return a result without replaying the user
     // message. Mark promptReplayed=true so their result isn't consumed as a
@@ -1047,7 +897,6 @@ export class ClaudeAcpAgent implements Agent {
       firstText.startsWith("/") && LOCAL_ONLY_COMMANDS.has(firstText.split(" ", 1)[0]);
 
     if (session.promptRunning) {
-      logPromptTrace("prompt queued behind active prompt");
       session.input.push(userMessage);
       const order = session.nextPendingOrder++;
       const cancelled = await new Promise<boolean>((resolve) => {
@@ -1062,46 +911,45 @@ export class ClaudeAcpAgent implements Agent {
 
     session.promptRunning = true;
     let handedOff = false;
+    let promptReplayed = isLocalOnlyCommand;
+    let terminalResultReceived = false;
     let stopReason: StopReason = "end_turn";
-    logPromptTrace("prompt loop started");
-
-    const promptWaitDiagnosticTimer = setInterval(() => {
-      const nowMs = Date.now();
-      const sinceLastSdkMessageMs = nowMs - promptDiagnostics.lastSdkMessageAtMs;
-      if (sinceLastSdkMessageMs < PROMPT_DIAGNOSTIC_WAIT_WARN_AFTER_MS) {
-        return;
-      }
-      if (nowMs - lastPromptWaitWarningAtMs < PROMPT_DIAGNOSTIC_WAIT_WARN_INTERVAL_MS) {
-        return;
-      }
-      promptWaitWarningLogged = true;
-      lastPromptWaitWarningAtMs = nowMs;
-      this.logger.error(
-        `[claude-agent-acp] prompt still waiting for SDK message; session=${
-          params.sessionId
-        }; ${formatPromptDiagnostics(session, promptDiagnostics, nowMs)}`,
-      );
-    }, 30_000);
 
     try {
       while (true) {
-        const { value: message, done } = await session.query.next();
-        const nowMs = Date.now();
+        const nextMessagePromise = session.pendingQueryNext ?? session.query.next();
+        session.pendingQueryNext = undefined;
+        let nextMessageResult: Awaited<ReturnType<Query["next"]>> | "timeout";
+
+        if (terminalResultReceived) {
+          let timeout: ReturnType<typeof setTimeout> | undefined;
+          const timeoutPromise = new Promise<"timeout">((resolve) => {
+            timeout = setTimeout(resolve, PROMPT_TERMINAL_RESULT_IDLE_GRACE_MS, "timeout");
+            timeout.unref?.();
+          });
+          nextMessageResult = await Promise.race([nextMessagePromise, timeoutPromise]);
+          if (timeout) {
+            clearTimeout(timeout);
+          }
+          if (nextMessageResult === "timeout") {
+            session.pendingQueryNext = nextMessagePromise;
+            return { stopReason, usage: sessionUsage(session) };
+          }
+        } else {
+          nextMessageResult = await nextMessagePromise;
+        }
+
+        const { value: message, done } = nextMessageResult;
 
         if (done || !message) {
-          this.logger.error(
-            `[claude-agent-acp] SDK query ended without prompt result; session=${
-              params.sessionId
-            }; done=${done}; ${formatPromptDiagnostics(session, promptDiagnostics, nowMs)}`,
-          );
+          if (terminalResultReceived) {
+            return { stopReason, usage: sessionUsage(session) };
+          }
           if (session.cancelled) {
             return { stopReason: "cancelled" };
           }
           break;
         }
-
-        updatePromptDiagnosticsFromSdkMessage(promptDiagnostics, message, nowMs);
-        logPromptTrace("received SDK message");
 
         if (
           session.emitRawSDKMessages &&
@@ -1173,16 +1021,8 @@ export class ClaudeAcpAgent implements Agent {
               }
               case "session_state_changed": {
                 if (message.state === "idle") {
-                  if (tracePrompt || promptWaitWarningLogged) {
-                    this.logger.error(
-                      `[claude-agent-acp] prompt returning on idle state; session=${
-                        params.sessionId
-                      }; stopReason=${stopReason}; ${formatPromptDiagnostics(
-                        session,
-                        promptDiagnostics,
-                        Date.now(),
-                      )}`,
-                    );
+                  if (!promptReplayed) {
+                    break;
                   }
                   return { stopReason, usage: sessionUsage(session) };
                 }
@@ -1232,17 +1072,6 @@ export class ClaudeAcpAgent implements Agent {
             // They should not influence the user-turn lifecycle (stop reason,
             // slash-command output forwarding) but their cost is real.
             const isTaskNotification = message.origin?.kind === "task-notification";
-            if (tracePrompt || promptWaitWarningLogged) {
-              this.logger.error(
-                `[claude-agent-acp] received result message; session=${
-                  params.sessionId
-                }; subtype=${message.subtype}; stopReason=${message.stop_reason}; isTaskNotification=${isTaskNotification}; ${formatPromptDiagnostics(
-                  session,
-                  promptDiagnostics,
-                  Date.now(),
-                )}`,
-              );
-            }
 
             // Send usage_update notification
             if (lastAssistantTotalUsage !== null) {
@@ -1371,6 +1200,13 @@ export class ClaudeAcpAgent implements Agent {
                 unreachable(message, this.logger);
                 break;
             }
+            // Claude SDK result messages are terminal for the user turn, but
+            // some long-running turns never emit the trailing idle transition.
+            // Keep draining briefly to preserve trailing SDK events; after the
+            // grace window, return instead of requiring an idle state forever.
+            if (!isTaskNotification && promptReplayed) {
+              terminalResultReceived = true;
+            }
             break;
           }
           case "stream_event": {
@@ -1449,6 +1285,7 @@ export class ClaudeAcpAgent implements Agent {
             // Check for prompt replay
             if (message.type === "user" && "uuid" in message && message.uuid) {
               if (message.uuid === promptUuid) {
+                promptReplayed = true;
                 break;
               }
 
@@ -1457,17 +1294,6 @@ export class ClaudeAcpAgent implements Agent {
                 pending.resolve(false);
                 session.pendingMessages.delete(message.uuid as string);
                 handedOff = true;
-                if (tracePrompt || promptWaitWarningLogged) {
-                  this.logger.error(
-                    `[claude-agent-acp] prompt handed off to pending user message; session=${
-                      params.sessionId
-                    }; nextPromptId=${message.uuid}; ${formatPromptDiagnostics(
-                      session,
-                      promptDiagnostics,
-                      Date.now(),
-                    )}`,
-                  );
-                }
                 // the current loop stops with end_turn,
                 // the loop of the next prompt continues running
                 return { stopReason: "end_turn", usage: sessionUsage(session) };
@@ -1535,9 +1361,9 @@ export class ClaudeAcpAgent implements Agent {
             const content =
               message.type === "assistant"
                 ? // Handled by stream events above
-                message.message.content.filter(
-                  (item) => !["text", "thinking"].includes(item.type),
-                )
+                  message.message.content.filter(
+                    (item) => !["text", "thinking"].includes(item.type),
+                  )
                 : message.message.content;
 
             for (const notification of toAcpNotifications(
@@ -1570,15 +1396,6 @@ export class ClaudeAcpAgent implements Agent {
       }
       throw new Error("Session did not end in result");
     } catch (error) {
-      this.logger.error(
-        `[claude-agent-acp] prompt loop failed; session=${
-          params.sessionId
-        }; error=${error instanceof Error ? error.message : String(error)}; ${formatPromptDiagnostics(
-          session,
-          promptDiagnostics,
-          Date.now(),
-        )}`,
-      );
       if (error instanceof RequestError || !(error instanceof Error)) {
         throw error;
       }
@@ -1601,18 +1418,6 @@ export class ClaudeAcpAgent implements Agent {
       }
       throw error;
     } finally {
-      clearInterval(promptWaitDiagnosticTimer);
-      if (tracePrompt || promptWaitWarningLogged) {
-        this.logger.error(
-          `[claude-agent-acp] prompt loop finalized; session=${
-            params.sessionId
-          }; handedOff=${handedOff}; ${formatPromptDiagnostics(
-            session,
-            promptDiagnostics,
-            Date.now(),
-          )}`,
-        );
-      }
       if (!handedOff) {
         session.promptRunning = false;
         // This usually should not happen, but in case the loop finishes
@@ -2972,10 +2777,10 @@ function getAvailableSlashCommands(commands: SlashCommand[]): AvailableCommand[]
     .map((command) => {
       const input = command.argumentHint
         ? {
-          hint: Array.isArray(command.argumentHint)
-            ? command.argumentHint.join(" ")
-            : command.argumentHint,
-        }
+            hint: Array.isArray(command.argumentHint)
+              ? command.argumentHint.join(" ")
+              : command.argumentHint,
+          }
         : null;
       let name = command.name;
       if (command.name.endsWith(" (MCP)")) {
@@ -3180,52 +2985,44 @@ export function toAcpNotifications(
         } else {
           // Only register hooks on first encounter to avoid double-firing
           if (registerHooks && !alreadyCached) {
-            registerHookCallback(
-              chunk.id,
-              {
-                onPostToolUseHook: async (toolUseId, toolInput, toolResponse) => {
-                  const toolUse = toolUseCache[toolUseId];
-                  if (toolUse) {
-                    // Both `Edit` and `Write` produce a structuredPatch in their
-                    // PostToolUse tool_response. For Edit the diff replaces the
-                    // optimistic content built at tool_use time. For Write the
-                    // optimistic content (built from `input.content` alone with
-                    // `oldText: null`) shows "creation" semantics regardless of
-                    // whether the file existed; the structuredPatch from the
-                    // hook lets us emit the real diff for `type: "update"`. The
-                    // helper returns `{}` if the response shape isn't usable.
-                    const editDiff =
-                      toolUse.name === "Edit" || toolUse.name === "Write"
-                        ? toolUpdateFromDiffToolResponse(toolResponse)
-                        : {};
-                    const update: SessionNotification["update"] = {
-                      _meta: {
-                        claudeCode: {
-                          toolResponse,
-                          toolName: toolUse.name,
-                        },
-                      } satisfies ToolUpdateMeta,
-                      toolCallId: toolUseId,
-                      sessionUpdate: "tool_call_update",
-                      ...editDiff,
-                    };
-                    await client.sessionUpdate({
-                      sessionId,
-                      update,
-                    });
-                  } else {
-                    logger.error(
-                      `[claude-agent-acp] Got a tool response for tool use that wasn't tracked: ${toolUseId}`,
-                    );
-                  }
-                },
+            registerHookCallback(chunk.id, {
+              onPostToolUseHook: async (toolUseId, toolInput, toolResponse) => {
+                const toolUse = toolUseCache[toolUseId];
+                if (toolUse) {
+                  // Both `Edit` and `Write` produce a structuredPatch in their
+                  // PostToolUse tool_response. For Edit the diff replaces the
+                  // optimistic content built at tool_use time. For Write the
+                  // optimistic content (built from `input.content` alone with
+                  // `oldText: null`) shows "creation" semantics regardless of
+                  // whether the file existed; the structuredPatch from the
+                  // hook lets us emit the real diff for `type: "update"`. The
+                  // helper returns `{}` if the response shape isn't usable.
+                  const editDiff =
+                    toolUse.name === "Edit" || toolUse.name === "Write"
+                      ? toolUpdateFromDiffToolResponse(toolResponse)
+                      : {};
+                  const update: SessionNotification["update"] = {
+                    _meta: {
+                      claudeCode: {
+                        toolResponse,
+                        toolName: toolUse.name,
+                      },
+                    } satisfies ToolUpdateMeta,
+                    toolCallId: toolUseId,
+                    sessionUpdate: "tool_call_update",
+                    ...editDiff,
+                  };
+                  await client.sessionUpdate({
+                    sessionId,
+                    update,
+                  });
+                } else {
+                  logger.error(
+                    `[claude-agent-acp] Got a tool response for tool use that wasn't tracked: ${toolUseId}`,
+                  );
+                }
               },
-              {
-                logger,
-                toolName: chunk.name,
-                sessionId,
-              },
-            );
+            });
           }
 
           let rawInput;
