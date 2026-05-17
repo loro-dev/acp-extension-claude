@@ -79,7 +79,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
 
     constructor(agent: Agent) {
       this.agent = agent;
-      this.resolveAvailableCommands = () => { };
+      this.resolveAvailableCommands = () => {};
       this.availableCommandsPromise = new Promise((resolve) => {
         this.resolveAvailableCommands = resolve;
       });
@@ -1473,10 +1473,10 @@ describe("permission requests", () => {
   ) {
     const mockClient = {
       requestPermission,
-      sessionUpdate: async () => { },
-      extMethod: async () => { },
+      sessionUpdate: async () => {},
+      extMethod: async () => {},
     } as unknown as AgentSideConnection;
-    const agent = new ClaudeAcpAgent(mockClient, { log: () => { }, error: () => { } });
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
     agent.clientCapabilities = { _meta: { claudeCode: { askUserQuestion: true } } } as any;
     agent.sessions["test-session"] = {
       modes: { currentModeId: mode, availableModes: [] },
@@ -1560,19 +1560,22 @@ describe("permission requests", () => {
   });
 
   it("accepts a custom free-text AskUserQuestion answer", async () => {
-    const agent = createAskUserQuestionAgent(async () => ({
-      outcome: {
-        outcome: "selected",
-        optionId: "answer",
-        _meta: {
-          claudeCode: {
-            askUserQuestion: {
-              answer: "Use Turso because it has edge replication",
+    const agent = createAskUserQuestionAgent(
+      async () =>
+        ({
+          outcome: {
+            outcome: "selected",
+            optionId: "answer",
+            _meta: {
+              claudeCode: {
+                askUserQuestion: {
+                  answer: "Use Turso because it has edge replication",
+                },
+              },
             },
           },
-        },
-      },
-    } as any));
+        }) as any,
+    );
 
     const singleQuestionInput = { questions: [askUserQuestionInput.questions[0]] };
     const result = await agent.canUseTool("test-session")("AskUserQuestion", singleQuestionInput, {
@@ -1626,12 +1629,15 @@ describe("permission requests", () => {
   });
 
   it("denies AskUserQuestion when the client does not return answers", async () => {
-    const agent = createAskUserQuestionAgent(async () => ({
-      outcome: {
-        outcome: "selected",
-        optionId: "answer",
-      },
-    } as any));
+    const agent = createAskUserQuestionAgent(
+      async () =>
+        ({
+          outcome: {
+            outcome: "selected",
+            optionId: "answer",
+          },
+        }) as any,
+    );
 
     const result = await agent.canUseTool("test-session")("AskUserQuestion", askUserQuestionInput, {
       signal: new AbortController().signal,
@@ -1649,10 +1655,10 @@ describe("permission requests", () => {
 describe("stop reason propagation", () => {
   function createMockAgent() {
     const mockClient = {
-      sessionUpdate: async () => { },
-      extMethod: async () => { },
+      sessionUpdate: async () => {},
+      extMethod: async () => {},
     } as unknown as AgentSideConnection;
-    return new ClaudeAcpAgent(mockClient, { log: () => { }, error: () => { } });
+    return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
   }
 
   function createResultMessage(overrides: {
@@ -1686,26 +1692,9 @@ describe("stop reason propagation", () => {
     };
   }
 
-  function injectSession(agent: ClaudeAcpAgent, messages: any[]) {
-    const input = new Pushable<any>();
-    async function* messageGenerator() {
-      // Wait for the prompt to push its user message so we can replay it
-      const iter = input[Symbol.asyncIterator]();
-      const { value: userMessage, done } = await iter.next();
-      if (!done && userMessage) {
-        yield {
-          type: "user",
-          message: userMessage.message,
-          parent_tool_use_id: null,
-          uuid: userMessage.uuid,
-          session_id: "test-session",
-          isReplay: true,
-        };
-      }
-      yield* messages;
-    }
+  function installSession(agent: ClaudeAcpAgent, input: Pushable<any>, query: any) {
     agent.sessions["test-session"] = {
-      query: messageGenerator() as any,
+      query,
       input,
       cancelled: false,
       cwd: "/test",
@@ -1734,6 +1723,27 @@ describe("stop reason propagation", () => {
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
     };
+  }
+
+  function injectSession(agent: ClaudeAcpAgent, messages: any[]) {
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      // Wait for the prompt to push its user message so we can replay it
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage, done } = await iter.next();
+      if (!done && userMessage) {
+        yield {
+          type: "user",
+          message: userMessage.message,
+          parent_tool_use_id: null,
+          uuid: userMessage.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+      }
+      yield* messages;
+    }
+    installSession(agent, input, messageGenerator() as any);
   }
 
   it("should return max_tokens when success result has stop_reason max_tokens", async () => {
@@ -1797,6 +1807,91 @@ describe("stop reason propagation", () => {
       createResultMessage({ subtype: "success", stop_reason: null, is_error: false }),
       { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+  });
+
+  it("should return when the prompt result arrives without a trailing idle state", async () => {
+    const agent = createMockAgent();
+    injectSession(agent, [
+      createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false }),
+    ]);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+  });
+
+  it("should return after a grace period when no SDK message follows the prompt result", async () => {
+    vi.useFakeTimers();
+    try {
+      const agent = createMockAgent();
+      const input = new Pushable<any>();
+      let resolveAfterResultNextRequested!: () => void;
+      const afterResultNextRequested = new Promise<void>((resolve) => {
+        resolveAfterResultNextRequested = resolve;
+      });
+
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield {
+          type: "user",
+          message: userMessage.message,
+          parent_tool_use_id: null,
+          uuid: userMessage.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+        yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+        resolveAfterResultNextRequested();
+        await new Promise(() => {});
+      }
+
+      installSession(agent, input, messageGenerator() as any);
+
+      const responsePromise = agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "test" }],
+      });
+      await afterResultNextRequested;
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      await expect(responsePromise).resolves.toMatchObject({ stopReason: "end_turn" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("should ignore stale idle state before the current prompt replay", async () => {
+    const agent = createMockAgent();
+    const input = new Pushable<any>();
+
+    async function* messageGenerator() {
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield {
+        type: "user",
+        message: userMessage.message,
+        parent_tool_use_id: null,
+        uuid: userMessage.uuid,
+        session_id: "test-session",
+        isReplay: true,
+      };
+      yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+    }
+
+    installSession(agent, input, messageGenerator() as any);
 
     const response = await agent.prompt({
       sessionId: "test-session",
@@ -1997,13 +2092,13 @@ describe("stop reason propagation", () => {
 describe("session/close", () => {
   function createMockAgent() {
     const mockClient = {
-      sessionUpdate: async () => { },
+      sessionUpdate: async () => {},
     } as unknown as AgentSideConnection;
-    return new ClaudeAcpAgent(mockClient, { log: () => { }, error: () => { } });
+    return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
   }
 
   function injectSession(agent: ClaudeAcpAgent, sessionId: string) {
-    function* empty() { }
+    function* empty() {}
     const gen = Object.assign(empty(), { interrupt: vi.fn(), close: vi.fn() });
     agent.sessions[sessionId] = {
       query: gen as any,
@@ -2086,9 +2181,9 @@ describe("session/close", () => {
 describe("getOrCreateSession param change detection", () => {
   function createMockAgent() {
     const mockClient = {
-      sessionUpdate: async () => { },
+      sessionUpdate: async () => {},
     } as unknown as AgentSideConnection;
-    return new ClaudeAcpAgent(mockClient, { log: () => { }, error: () => { } });
+    return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
   }
 
   function injectSession(
@@ -2098,7 +2193,7 @@ describe("getOrCreateSession param change detection", () => {
   ) {
     const cwd = opts.cwd ?? "/test";
     const mcpServers = (opts.mcpServers ?? []) as any[];
-    function* empty() { }
+    function* empty() {}
     const gen = Object.assign(empty(), {
       interrupt: vi.fn(),
       close: vi.fn(),
@@ -2312,9 +2407,9 @@ describe("usage_update computation", () => {
       sessionUpdate: async (notification: any) => {
         updates.push(notification);
       },
-      extMethod: async () => { },
+      extMethod: async () => {},
     } as unknown as AgentSideConnection;
-    const agent = new ClaudeAcpAgent(mockClient, { log: () => { }, error: () => { } });
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
     return { agent, updates };
   }
 
@@ -3215,9 +3310,9 @@ describe("emitRawSDKMessages", () => {
       extNotification: async (method: string, params: any) => {
         extNotifications.push({ method, params });
       },
-      extMethod: async () => { },
+      extMethod: async () => {},
     } as unknown as AgentSideConnection;
-    const agent = new ClaudeAcpAgent(mockClient, { log: () => { }, error: () => { } });
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
     return { agent, updates, extNotifications };
   }
 

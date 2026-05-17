@@ -92,6 +92,7 @@ export const CLAUDE_CONFIG_DIR =
 const MAX_TITLE_LENGTH = 256;
 const PROMPT_DIAGNOSTIC_WAIT_WARN_AFTER_MS = 120_000;
 const PROMPT_DIAGNOSTIC_WAIT_WARN_INTERVAL_MS = 300_000;
+const PROMPT_TERMINAL_RESULT_IDLE_GRACE_MS = 5_000;
 
 type PromptDiagnostics = {
   promptId: string;
@@ -242,6 +243,7 @@ const DEFAULT_CONTEXT_WINDOW = 200000;
 
 type Session = {
   query: Query;
+  pendingQueryNext?: Promise<Awaited<ReturnType<Query["next"]>>>;
   input: Pushable<SDKUserMessage>;
   cancelled: boolean;
   cwd: string;
@@ -318,14 +320,14 @@ function computeSessionFingerprint(params: {
 
 type BackgroundTerminal =
   | {
-    handle: TerminalHandle;
-    status: "started";
-    lastOutput: TerminalOutputResponse | null;
-  }
+      handle: TerminalHandle;
+      status: "started";
+      lastOutput: TerminalOutputResponse | null;
+    }
   | {
-    status: "aborted" | "exited" | "killed" | "timedOut";
-    pendingOutput: TerminalOutputResponse;
-  };
+      status: "aborted" | "exited" | "killed" | "timedOut";
+      pendingOutput: TerminalOutputResponse;
+    };
 
 export type SDKMessageFilter = {
   type: string;
@@ -701,7 +703,10 @@ function normalizeAnswerValue(value: unknown): string | null {
     return answer.length > 0 ? answer : null;
   }
   if (Array.isArray(value) && value.every((entry) => typeof entry === "string")) {
-    const answer = value.map((entry) => entry.trim()).filter(Boolean).join(", ");
+    const answer = value
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+      .join(", ");
     return answer.length > 0 ? answer : null;
   }
   return null;
@@ -1062,6 +1067,8 @@ export class ClaudeAcpAgent implements Agent {
 
     session.promptRunning = true;
     let handedOff = false;
+    let promptReplayed = isLocalOnlyCommand;
+    let terminalResultReceived = false;
     let stopReason: StopReason = "end_turn";
     logPromptTrace("prompt loop started");
 
@@ -1085,10 +1092,57 @@ export class ClaudeAcpAgent implements Agent {
 
     try {
       while (true) {
-        const { value: message, done } = await session.query.next();
+        const nextMessagePromise = session.pendingQueryNext ?? session.query.next();
+        session.pendingQueryNext = undefined;
+        let nextMessageResult: Awaited<ReturnType<Query["next"]>> | "timeout";
+
+        if (terminalResultReceived) {
+          let timeout: ReturnType<typeof setTimeout> | undefined;
+          const timeoutPromise = new Promise<"timeout">((resolve) => {
+            timeout = setTimeout(resolve, PROMPT_TERMINAL_RESULT_IDLE_GRACE_MS, "timeout");
+            timeout.unref?.();
+          });
+          nextMessageResult = await Promise.race([nextMessagePromise, timeoutPromise]);
+          if (timeout) {
+            clearTimeout(timeout);
+          }
+          if (nextMessageResult === "timeout") {
+            session.pendingQueryNext = nextMessagePromise;
+            if (tracePrompt || promptWaitWarningLogged) {
+              this.logger.error(
+                `[claude-agent-acp] prompt returning after terminal result idle grace; session=${
+                  params.sessionId
+                }; stopReason=${stopReason}; graceMs=${PROMPT_TERMINAL_RESULT_IDLE_GRACE_MS}; ${formatPromptDiagnostics(
+                  session,
+                  promptDiagnostics,
+                  Date.now(),
+                )}`,
+              );
+            }
+            return { stopReason, usage: sessionUsage(session) };
+          }
+        } else {
+          nextMessageResult = await nextMessagePromise;
+        }
+
+        const { value: message, done } = nextMessageResult;
         const nowMs = Date.now();
 
         if (done || !message) {
+          if (terminalResultReceived) {
+            if (tracePrompt || promptWaitWarningLogged) {
+              this.logger.error(
+                `[claude-agent-acp] prompt returning after SDK query ended post-result; session=${
+                  params.sessionId
+                }; stopReason=${stopReason}; done=${done}; ${formatPromptDiagnostics(
+                  session,
+                  promptDiagnostics,
+                  nowMs,
+                )}`,
+              );
+            }
+            return { stopReason, usage: sessionUsage(session) };
+          }
           this.logger.error(
             `[claude-agent-acp] SDK query ended without prompt result; session=${
               params.sessionId
@@ -1173,6 +1227,16 @@ export class ClaudeAcpAgent implements Agent {
               }
               case "session_state_changed": {
                 if (message.state === "idle") {
+                  if (!promptReplayed) {
+                    if (tracePrompt || promptWaitWarningLogged) {
+                      this.logger.error(
+                        `[claude-agent-acp] ignoring idle state before prompt replay; session=${
+                          params.sessionId
+                        }; ${formatPromptDiagnostics(session, promptDiagnostics, Date.now())}`,
+                      );
+                    }
+                    break;
+                  }
                   if (tracePrompt || promptWaitWarningLogged) {
                     this.logger.error(
                       `[claude-agent-acp] prompt returning on idle state; session=${
@@ -1371,6 +1435,24 @@ export class ClaudeAcpAgent implements Agent {
                 unreachable(message, this.logger);
                 break;
             }
+            // Claude SDK result messages are terminal for the user turn, but
+            // some long-running turns never emit the trailing idle transition.
+            // Keep draining briefly to preserve trailing SDK events; after the
+            // grace window, return instead of requiring an idle state forever.
+            if (!isTaskNotification && promptReplayed) {
+              terminalResultReceived = true;
+              if (tracePrompt || promptWaitWarningLogged) {
+                this.logger.error(
+                  `[claude-agent-acp] received terminal prompt result; session=${
+                    params.sessionId
+                  }; stopReason=${stopReason}; ${formatPromptDiagnostics(
+                    session,
+                    promptDiagnostics,
+                    Date.now(),
+                  )}`,
+                );
+              }
+            }
             break;
           }
           case "stream_event": {
@@ -1449,6 +1531,7 @@ export class ClaudeAcpAgent implements Agent {
             // Check for prompt replay
             if (message.type === "user" && "uuid" in message && message.uuid) {
               if (message.uuid === promptUuid) {
+                promptReplayed = true;
                 break;
               }
 
@@ -1535,9 +1618,9 @@ export class ClaudeAcpAgent implements Agent {
             const content =
               message.type === "assistant"
                 ? // Handled by stream events above
-                message.message.content.filter(
-                  (item) => !["text", "thinking"].includes(item.type),
-                )
+                  message.message.content.filter(
+                    (item) => !["text", "thinking"].includes(item.type),
+                  )
                 : message.message.content;
 
             for (const notification of toAcpNotifications(
@@ -2972,10 +3055,10 @@ function getAvailableSlashCommands(commands: SlashCommand[]): AvailableCommand[]
     .map((command) => {
       const input = command.argumentHint
         ? {
-          hint: Array.isArray(command.argumentHint)
-            ? command.argumentHint.join(" ")
-            : command.argumentHint,
-        }
+            hint: Array.isArray(command.argumentHint)
+              ? command.argumentHint.join(" ")
+              : command.argumentHint,
+          }
         : null;
       let name = command.name;
       if (command.name.endsWith(" (MCP)")) {
