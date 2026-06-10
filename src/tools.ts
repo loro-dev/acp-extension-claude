@@ -8,6 +8,7 @@ import {
 import { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import {
   AgentInput,
+  AskUserQuestionInput,
   BashInput,
   FileEditInput,
   FileReadInput,
@@ -106,15 +107,6 @@ interface ToolUpdate {
     };
   };
 }
-
-type AskUserQuestionInput = {
-  questions?: Array<{
-    question?: string;
-    header?: string;
-    options?: Array<{ label?: string; description?: string; preview?: string }>;
-    multiSelect?: boolean;
-  }>;
-};
 
 /**
  * Convert an absolute file path to a project-relative path for display.
@@ -425,45 +417,20 @@ export function toolInfoFromToolUse(
     }
 
     case "AskUserQuestion": {
-      const input = toolUse.input as AskUserQuestionInput | undefined;
+      const input = toolUse.input as Partial<AskUserQuestionInput> | undefined;
       const questions = Array.isArray(input?.questions) ? input.questions : [];
-      const title = questions[0]?.question ? questions[0].question : "Answer question";
-      const text = questions
-        .map((question, index) => {
-          const options = Array.isArray(question.options) ? question.options : [];
-          const optionText = options
-            .map((option) =>
-              option.label && option.description
-                ? `- ${option.label}: ${option.description}`
-                : option.label
-                  ? `- ${option.label}`
-                  : null,
-            )
-            .filter(Boolean)
-            .join("\n");
-          const mode = question.multiSelect ? "Multiple selections allowed" : "Choose one option";
-          return [
-            `${index + 1}. ${question.question ?? "Question"}`,
-            mode,
-            optionText,
-            "Custom answer is supported.",
-          ]
-            .filter(Boolean)
-            .join("\n");
-        })
-        .join("\n\n");
-
       return {
-        title,
-        kind: "think",
-        content: text
-          ? [
-              {
-                type: "content" as const,
-                content: { type: "text" as const, text },
-              },
-            ]
-          : [],
+        title:
+          questions.length === 1 && questions[0]?.question
+            ? questions[0].question
+            : "Asking for your input",
+        kind: "other",
+        content: questions
+          .filter((q) => typeof q?.question === "string")
+          .map((q) => ({
+            type: "content" as const,
+            content: { type: "text" as const, text: q.question },
+          })),
       };
     }
 
