@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
+import { SessionNotification } from "@agentclientprotocol/sdk";
 import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
-import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
 
 const { registerHookCallbackSpy } = vi.hoisted(() => ({
   registerHookCallbackSpy: vi.fn(),
@@ -84,7 +84,7 @@ describe("session config options", () => {
   let setModelSpy: ReturnType<typeof vi.fn>;
   let applyFlagSettingsSpy: ReturnType<typeof vi.fn>;
 
-  function createMockClient(): AgentSideConnection {
+  function createMockClient(): AcpClient {
     return {
       sessionUpdate: async (notification: SessionNotification) => {
         sessionUpdates.push(notification);
@@ -92,7 +92,7 @@ describe("session config options", () => {
       requestPermission: async () => ({ outcome: { outcome: "cancelled" } }),
       readTextFile: async () => ({ content: "" }),
       writeTextFile: async () => ({}),
-    } as unknown as AgentSideConnection;
+    } as unknown as AcpClient;
   }
 
   function populateSession() {
@@ -214,6 +214,31 @@ describe("session config options", () => {
           value: "invalid-mode",
         }),
       ).rejects.toThrow("Invalid value for config option mode: invalid-mode");
+    });
+
+    it("rejects mode and config changes once the query stream has closed (husk session)", async () => {
+      // After an unexpected stream death the session lingers as a husk
+      // (queryClosed=true) so prompt() can answer with a clear error. The
+      // config/mode handlers must do the same rather than calling setModel/
+      // setPermissionMode on the closed query.
+      const session = (agent as unknown as { sessions: Record<string, { queryClosed?: boolean }> })
+        .sessions[SESSION_ID];
+      session.queryClosed = true;
+
+      await expect(
+        agent.setSessionConfigOption({
+          sessionId: SESSION_ID,
+          configId: "model",
+          value: "claude-sonnet-4-6",
+        }),
+      ).rejects.toThrow(/start a new session/);
+      await expect(agent.setSessionMode({ sessionId: SESSION_ID, modeId: "plan" })).rejects.toThrow(
+        /start a new session/,
+      );
+
+      // Short-circuited before touching the (closed) query.
+      expect(setModelSpy).not.toHaveBeenCalled();
+      expect(setPermissionModeSpy).not.toHaveBeenCalled();
     });
 
     it("changes mode, sends current_mode_update but not config_option_update", async () => {

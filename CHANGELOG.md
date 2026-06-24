@@ -1,5 +1,90 @@
 # Changelog
 
+## [0.50.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.49.0...v0.50.0) (2026-06-23)
+
+
+### Features
+
+* **acp:** Handle ACP request cancellation signals ([#801](https://github.com/agentclientprotocol/claude-agent-acp/issues/801)) ([9013d1d](https://github.com/agentclientprotocol/claude-agent-acp/commit/9013d1d46883a7f3774a63a9dca16c4a0f634a97))
+* **deps:** bump actions/checkout from 6.0.3 to 7.0.0 ([#803](https://github.com/agentclientprotocol/claude-agent-acp/issues/803)) ([044c43e](https://github.com/agentclientprotocol/claude-agent-acp/commit/044c43e0c894082b9e747c01e9dbde6e21036823))
+* **deps:** upgrade to @anthropic-ai/claude-agent-sdk@0.3.186 ([#806](https://github.com/agentclientprotocol/claude-agent-acp/issues/806)) ([a7e6137](https://github.com/agentclientprotocol/claude-agent-acp/commit/a7e6137f6877b72b8daa39e74971c3559db8d28f))
+
+## [0.49.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.48.0...v0.49.0) (2026-06-22)
+
+
+### Features
+
+* Update to claude-agent-sdk 0.3.185 ([#798](https://github.com/agentclientprotocol/claude-agent-acp/issues/798)) ([8dc8c86](https://github.com/agentclientprotocol/claude-agent-acp/commit/8dc8c864263fa50d03bec7ebff7aee776604cb3d))
+
+
+### Bug Fixes
+
+* Deduplicate streamed assistant blocks by content ([#800](https://github.com/agentclientprotocol/claude-agent-acp/issues/800)) ([960f62d](https://github.com/agentclientprotocol/claude-agent-acp/commit/960f62d76582ae5c9c5575ab66974809049ce1d0))
+* Infer 1M context from model descriptions ([#799](https://github.com/agentclientprotocol/claude-agent-acp/issues/799)) ([508453c](https://github.com/agentclientprotocol/claude-agent-acp/commit/508453c288b4a12701abd507199e7fa0ab172171))
+
+## [0.48.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.47.0...v0.48.0) (2026-06-19)
+
+
+### Features
+
+* Agent selection dropdown in config options ([#794](https://github.com/agentclientprotocol/claude-agent-acp/issues/794)) ([5729c47](https://github.com/agentclientprotocol/claude-agent-acp/commit/5729c471f92e1d2a191eb2a6d18c2be47821e9ec))
+* **deps:** bump the minor group with 11 updates ([#787](https://github.com/agentclientprotocol/claude-agent-acp/issues/787)) ([ad3b5fe](https://github.com/agentclientprotocol/claude-agent-acp/commit/ad3b5fe74527f83964695a1e8056d010b981fc79))
+* Update to claude-agent-sdk 0.3.183 ([#791](https://github.com/agentclientprotocol/claude-agent-acp/issues/791)) ([744b2d4](https://github.com/agentclientprotocol/claude-agent-acp/commit/744b2d41128f67091d4136283594c0db11ea4db5))
+* Update to new ACP SDK patterns ([#790](https://github.com/agentclientprotocol/claude-agent-acp/issues/790)) ([2554c7b](https://github.com/agentclientprotocol/claude-agent-acp/commit/2554c7bf980472760a6e7810b826f030d2c3af25))
+
+
+### Bug Fixes
+
+* duplicate assistant text when turn activates mid-message ([#789](https://github.com/agentclientprotocol/claude-agent-acp/issues/789)) ([1c80bf8](https://github.com/agentclientprotocol/claude-agent-acp/commit/1c80bf8e56a9279dc799e7bbdcae87241e99c18b))
+* Skip empty thinking chunks ([#793](https://github.com/agentclientprotocol/claude-agent-acp/issues/793)) ([15fdf26](https://github.com/agentclientprotocol/claude-agent-acp/commit/15fdf26fc7d3a6c51e89d3e56fc91dd00cb3d7ae))
+* surface Bash tool image output instead of dropping it ([#617](https://github.com/agentclientprotocol/claude-agent-acp/issues/617)) ([a759e64](https://github.com/agentclientprotocol/claude-agent-acp/commit/a759e64ef6d9b7c5bfe9a6e6b182db835f8ed3b6))
+
+## [0.47.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.46.0...v0.47.0) (2026-06-17)
+
+
+### Features
+
+* Update to claude-agent-sdk 0.3.179 ([#783](https://github.com/agentclientprotocol/claude-agent-acp/issues/783)) ([59a098c](https://github.com/agentclientprotocol/claude-agent-acp/commit/59a098c2b530bbae034e9a2dfbd31f8b4ef2a4d0))
+
+
+### Bug Fixes
+
+* Duplicate assistant messages in feed ([#785](https://github.com/agentclientprotocol/claude-agent-acp/issues/785)) ([12d34e6](https://github.com/agentclientprotocol/claude-agent-acp/commit/12d34e64e53564602ac1c38a30127e234c5c25ff))
+
+## [0.46.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.45.1...v0.46.0) (2026-06-16)
+
+
+### Features
+
+* Update to claude-agent-sdk 0.3.178 ([#777](https://github.com/agentclientprotocol/claude-agent-acp/issues/777)) ([58549ff](https://github.com/agentclientprotocol/claude-agent-acp/commit/58549ffe6a8b02ce59894e567407bd4299c11428))
+
+
+### Bug Fixes
+
+* Better handle out of turn events ([#780](https://github.com/agentclientprotocol/claude-agent-acp/issues/780)) ([4f273a2](https://github.com/agentclientprotocol/claude-agent-acp/commit/4f273a20d870c9c69f71556b8e0519f1de30f285))
+* Forward option details in elicitation meta ([#779](https://github.com/agentclientprotocol/claude-agent-acp/issues/779)) ([b364059](https://github.com/agentclientprotocol/claude-agent-acp/commit/b3640599ae685beecacd93e012d5bbc9dac716f7)), closes [#764](https://github.com/agentclientprotocol/claude-agent-acp/issues/764)
+
+## [0.45.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.45.0...v0.45.1) (2026-06-16)
+
+
+### Bug Fixes
+
+* Fix terminal error printing as text instead of terminal output ([#776](https://github.com/agentclientprotocol/claude-agent-acp/issues/776)) ([db6eaaf](https://github.com/agentclientprotocol/claude-agent-acp/commit/db6eaaf71484a321e47093ad65bcf8994943cb31))
+* Scope custom answers per question ([#774](https://github.com/agentclientprotocol/claude-agent-acp/issues/774)) ([d58004a](https://github.com/agentclientprotocol/claude-agent-acp/commit/d58004a34880e0a76833697319eb2a9efa6a43c7))
+
+## [0.45.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.44.0...v0.45.0) (2026-06-15)
+
+
+### Features
+
+* **deps-dev:** bump the minor group with 3 updates ([#763](https://github.com/agentclientprotocol/claude-agent-acp/issues/763)) ([7de5e4b](https://github.com/agentclientprotocol/claude-agent-acp/commit/7de5e4bcca9bfea70593092060f82bc8abe33e0e))
+* **deps:** bump @anthropic-ai/claude-agent-sdk to 0.3.177 ([#771](https://github.com/agentclientprotocol/claude-agent-acp/issues/771)) ([1be5ca5](https://github.com/agentclientprotocol/claude-agent-acp/commit/1be5ca57ee772fe90e41126365dc4186a18ad257))
+
+
+### Bug Fixes
+
+* preserve ANTHROPIC_CUSTOM_MODEL_OPTION when availableModels is set ([#768](https://github.com/agentclientprotocol/claude-agent-acp/issues/768)) ([cc2885f](https://github.com/agentclientprotocol/claude-agent-acp/commit/cc2885f6a9993cf61e759c3c770015f94c218627))
+
 ## [0.44.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.43.0...v0.44.0) (2026-06-09)
 
 
