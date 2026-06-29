@@ -17,6 +17,7 @@ import {
   ListSessionsResponse,
   LoadSessionRequest,
   LoadSessionResponse,
+  LogoutRequest,
   methods,
   ndJsonStream,
   NewSessionRequest,
@@ -50,6 +51,7 @@ import {
   AgentInfo,
   CanUseTool,
   deleteSession,
+  getSessionInfo,
   getSessionMessages,
   listSessions,
   McpServerConfig,
@@ -73,11 +75,13 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { promisify } from "node:util";
 import packageJson from "../package.json" with { type: "json" };
 import {
   applyAskElicitationResponse,
@@ -113,6 +117,8 @@ import { getUsage } from "./usage.js";
 
 export const CLAUDE_CONFIG_DIR =
   process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
+
+const execFileAsync = promisify(execFile);
 
 const MAX_TITLE_LENGTH = 256;
 
@@ -268,6 +274,12 @@ type Session = {
   /** Accumulated task list for the session, keyed by task ID. Task IDs are
    *  per-session, so this state must not be shared across sessions. */
   taskState: TaskState;
+  /** Last session title we pushed to the client via `session_info_update`.
+   *  The SDK auto-generates a title in a background task and persists it to the
+   *  session file; we poll it on each turn-end (`session_state_changed: idle`)
+   *  and only notify the client when it actually changes. Undefined until the
+   *  first title is observed. */
+  lastTitle?: string;
   /** Caches `tool_use` blocks by id so the matching `tool_result` can recover
    *  the tool name/input when mapping it to a `tool_call_update`. Per-session
    *  (tool_use ids are only unique within a session) and pruned at
@@ -441,8 +453,7 @@ function isMuslLibc(): boolean {
   // process.report.getReport().header.glibcVersionRuntime is populated when
   // Node is dynamically linked against glibc, and absent on musl.
   const report = process.report?.getReport() as
-    | { header?: { glibcVersionRuntime?: string } }
-    | undefined;
+    { header?: { glibcVersionRuntime?: string } } | undefined;
   return !report?.header?.glibcVersionRuntime;
 }
 
@@ -854,6 +865,9 @@ export class ClaudeAcpAgent {
           http: true,
           sse: true,
         },
+        auth: {
+          logout: {},
+        },
         loadSession: true,
         sessionCapabilities: {
           additionalDirectories: {},
@@ -949,12 +963,70 @@ export class ClaudeAcpAgent {
     };
   }
 
+  /** Read the SDK-maintained title for a session and, if it changed since the
+   *  last time we looked, notify the client with a `session_info_update`. The
+   *  SDK has no push event for the title it auto-generates in the background, so
+   *  we pull it at turn-end. A missing session file or read error is non-fatal:
+   *  the title is best-effort and another turn will retry. */
+  private async maybeUpdateSessionTitle(sessionId: string, session: Session): Promise<void> {
+    let info;
+    try {
+      info = await getSessionInfo(sessionId, { dir: session.cwd });
+    } catch (error) {
+      this.logger.error(`Session ${sessionId}: failed to read session info: ${error}`);
+      return;
+    }
+    // `customTitle` is a user-set `/rename`; `summary` is the auto-generated
+    // title (or first prompt). Prefer the explicit title when present.
+    const rawTitle = info?.customTitle ?? info?.summary;
+    if (!rawTitle) {
+      return;
+    }
+    const title = sanitizeTitle(rawTitle);
+    if (title === session.lastTitle) {
+      return;
+    }
+    session.lastTitle = title;
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "session_info_update",
+        title,
+        updatedAt: new Date(info!.lastModified).toISOString(),
+      },
+    });
+  }
+
   async authenticate(_params: AuthenticateRequest): Promise<void> {
     if (_params.methodId === "gateway" || _params.methodId === "gateway-bedrock") {
       this.gatewayAuthRequest = _params as GatewayAuthRequest;
       return;
     }
     throw new Error("Method not implemented.");
+  }
+
+  async logout(_params: LogoutRequest): Promise<void> {
+    // Clear in-memory gateway credentials supplied via `authenticate`. The
+    // gateway method never touches the on-disk credential store, so dropping
+    // this reference is the whole logout for that path.
+    this.gatewayAuthRequest = undefined;
+
+    // For the Claude/Console login methods the credentials live in the native
+    // CLI's store (keychain or config dir), which only the binary can clear.
+    // `claude auth logout` is non-interactive and idempotent.
+    const cliPath = await claudeCliPath();
+    try {
+      await execFileAsync(cliPath, ["auth", "logout"]);
+    } catch (error) {
+      const stderr =
+        typeof error === "object" && error && "stderr" in error
+          ? String((error as { stderr: unknown }).stderr).trim()
+          : undefined;
+      throw RequestError.internalError(
+        { stderr: stderr || undefined },
+        `claude auth logout failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
@@ -1371,6 +1443,11 @@ export class ClaudeAcpAgent {
                   if (session.cancelled) {
                     settleActive({ stopReason: "cancelled" });
                   }
+                  // The SDK generates the session title in a background task and
+                  // persists it to the session file; `idle` is the turn-over
+                  // signal, so it's the point at which a new title may have
+                  // landed. Push it to the client if it changed.
+                  await this.maybeUpdateSessionTitle(params.sessionId, session);
                 }
                 break;
               }
@@ -1526,6 +1603,7 @@ export class ClaudeAcpAgent {
               case "api_retry":
               case "thinking_tokens":
               case "model_refusal_fallback":
+              case "model_refusal_no_fallback":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
               default:
@@ -4567,6 +4645,7 @@ export function runAcp() {
       agent.setSessionConfigOption(ctx.params),
     )
     .onRequest(methods.agent.authenticate, (ctx) => agent.authenticate(ctx.params))
+    .onRequest(methods.agent.logout, (ctx) => agent.logout(ctx.params))
     .onRequest(methods.agent.session.prompt, (ctx) =>
       runPromptWithCancellation(agent, ctx.params, ctx.signal),
     )
