@@ -1811,6 +1811,7 @@ describe("permission request cancellation", () => {
       currentAgent: "default",
       abortController: new AbortController(),
       emitRawSDKMessages: false,
+      emitIgnoredSDKMessages: false,
       contextWindowSize: 200000,
       taskState: new Map(),
       toolUseCache: {},
@@ -2579,6 +2580,7 @@ describe("session/close", () => {
       currentAgent: "default",
       abortController: new AbortController(),
       emitRawSDKMessages: false,
+      emitIgnoredSDKMessages: false,
       contextWindowSize: 200000,
       taskState: new Map(),
       toolUseCache: {},
@@ -2664,6 +2666,7 @@ describe("session/delete", () => {
       currentAgent: "default",
       abortController: new AbortController(),
       emitRawSDKMessages: false,
+      emitIgnoredSDKMessages: false,
       contextWindowSize: 200000,
       taskState: new Map(),
       toolUseCache: {},
@@ -2766,6 +2769,7 @@ describe("getOrCreateSession param change detection", () => {
       currentAgent: "default",
       abortController: new AbortController(),
       emitRawSDKMessages: false,
+      emitIgnoredSDKMessages: false,
       contextWindowSize: 200000,
       taskState: new Map(),
       toolUseCache: {},
@@ -4456,6 +4460,67 @@ describe("emitRawSDKMessages", () => {
     expect(sdkMessages).toHaveLength(0);
   });
 
+  it("mirrors dropped SDK messages on _claude/sdkMessageIgnored when emitIgnoredSDKMessages is on", async () => {
+    const { agent, extNotifications } = createMockAgentWithExtNotification();
+    injectSession(
+      agent,
+      [
+        // status/compacting is forwarded to the client → must NOT be flagged.
+        { type: "system", subtype: "status", status: "compacting", session_id: "test-session" },
+        // task_notification is a background-work signal the consumer drops → must be flagged.
+        {
+          type: "system",
+          subtype: "task_notification",
+          task_id: "t1",
+          status: "completed",
+          output_file: "",
+          summary: "",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        createResultMessage(),
+        { type: "system", subtype: "session_state_changed", state: "idle" },
+      ],
+      false,
+    );
+    agent.sessions["test-session"].emitIgnoredSDKMessages = true;
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const ignored = extNotifications.filter((n) => n.method === "_claude/sdkMessageIgnored");
+    expect(ignored.some((n) => n.params.log === "[acp-ignore] system/task_notification")).toBe(
+      true,
+    );
+    expect(ignored.some((n) => n.params.log === "[acp-ignore] system/status")).toBe(false);
+  });
+
+  it("does not mirror ignored messages when emitIgnoredSDKMessages is off", async () => {
+    const { agent, extNotifications } = createMockAgentWithExtNotification();
+    injectSession(
+      agent,
+      [
+        {
+          type: "system",
+          subtype: "task_notification",
+          task_id: "t1",
+          status: "completed",
+          output_file: "",
+          summary: "",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        createResultMessage(),
+        { type: "system", subtype: "session_state_changed", state: "idle" },
+      ],
+      false,
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const ignored = extNotifications.filter((n) => n.method === "_claude/sdkMessageIgnored");
+    expect(ignored).toHaveLength(0);
+  });
+
   it("emits only messages matching a filter array", async () => {
     const { agent, extNotifications } = createMockAgentWithExtNotification();
     injectSession(
@@ -4982,6 +5047,7 @@ describe("post-error recovery", () => {
       currentAgent: "default",
       abortController: new AbortController(),
       emitRawSDKMessages: false,
+      emitIgnoredSDKMessages: false,
       contextWindowSize: 200000,
       taskState: new Map(),
       toolUseCache: {},
@@ -5552,6 +5618,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       currentAgent: "default",
       abortController: new AbortController(),
       emitRawSDKMessages: false,
+      emitIgnoredSDKMessages: false,
       contextWindowSize: 200000,
       taskState: new Map(),
       toolUseCache: {},
@@ -6005,6 +6072,7 @@ describe("agent selection config option", () => {
         currentAgent: "default",
         abortController: new AbortController(),
         emitRawSDKMessages: false,
+        emitIgnoredSDKMessages: false,
         contextWindowSize: 200000,
         taskState: new Map(),
         toolUseCache: {},

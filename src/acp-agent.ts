@@ -265,6 +265,12 @@ type Session = {
    *  cancel. */
   forceCancelTimer?: ReturnType<typeof setTimeout>;
   emitRawSDKMessages: boolean | SDKMessageFilter[];
+  /** Debug flag: when true, SDK messages the consumer drops (does not forward
+   *  to the client) are mirrored on the `_claude/sdkMessageIgnored` extension
+   *  channel with an `[acp-ignore]` log prefix. TEMP(debug): currently
+   *  default-ON (see session creation); a client can opt out by passing
+   *  `_meta.claudeCode.emitIgnoredSDKMessages: false`. */
+  emitIgnoredSDKMessages: boolean;
   /** Context window size of the last top-level assistant model, carried across
    *  prompts so mid-stream usage_update notifications report a correct `size`
    *  before the turn's first result message arrives. Defaults to
@@ -353,6 +359,17 @@ export type NewSessionMeta = {
      * - SDKMessageFilter[]: emit only messages matching at least one filter
      */
     emitRawSDKMessages?: boolean | SDKMessageFilter[];
+    /**
+     * Debug aid for tracing turn lifecycle. SDK messages the adapter consumes
+     * but does NOT forward to the client (e.g. `task_started` /
+     * `task_notification` background-work signals, `hook_*`, `api_retry`) are
+     * mirrored as extNotification("_claude/sdkMessageIgnored", { log, message })
+     * with an `[acp-ignore]` prefix, so a downstream client can print them.
+     * - undefined: TEMP(debug) currently default-ON
+     * - true: emit ignored messages
+     * - false: opt out
+     */
+    emitIgnoredSDKMessages?: boolean;
   };
   additionalRoots?: string[];
 };
@@ -963,6 +980,32 @@ export class ClaudeAcpAgent {
     };
   }
 
+  /** Debug aid: surface an SDK message the adapter consumed but did NOT forward
+   *  to the client (e.g. `task_started`/`task_notification` background-work
+   *  signals, `hook_*`, `api_retry`). Emitted on the `_claude/sdkMessageIgnored`
+   *  extension channel with an `[acp-ignore]` log prefix so a downstream client
+   *  can print it. Gated behind the per-session `emitIgnoredSDKMessages` flag
+   *  and best-effort — a failure here must never disrupt the consumer loop. */
+  private async emitIgnoredSDKMessage(
+    sessionId: string,
+    session: Session,
+    message: { type: string; subtype?: string },
+  ): Promise<void> {
+    if (!session.emitIgnoredSDKMessages) {
+      return;
+    }
+    const label = message.subtype ? `${message.type}/${message.subtype}` : message.type;
+    try {
+      await this.client.extNotification?.("_claude/sdkMessageIgnored", {
+        sessionId,
+        log: `[acp-ignore] ${label}`,
+        message: message as unknown as Record<string, unknown>,
+      });
+    } catch (error) {
+      this.logger.error(`Failed to emit [acp-ignore] notification for ${label}: ${error}`);
+    }
+  }
+
   /** Read the SDK-maintained title for a session and, if it changed since the
    *  last time we looked, notify the client with a `session_info_update`. The
    *  SDK has no push event for the title it auto-generates in the background, so
@@ -1346,6 +1389,7 @@ export class ClaudeAcpAgent {
           case "system":
             switch (message.subtype) {
               case "init":
+                await this.emitIgnoredSDKMessage(params.sessionId, session, message);
                 break;
               case "status": {
                 if (message.status === "compacting") {
@@ -1577,11 +1621,13 @@ export class ClaudeAcpAgent {
               case "task_notification":
               case "task_progress":
               case "task_updated":
+                await this.emitIgnoredSDKMessage(params.sessionId, session, message);
                 break;
               case "worker_shutting_down":
                 // A Remote Control worker announced a graceful teardown. This is a
                 // live-tail signal for remote clients to explain why a session went
                 // away; it's not meaningful for a local stdio ACP session.
+                await this.emitIgnoredSDKMessage(params.sessionId, session, message);
                 break;
               case "elicitation_complete": {
                 // A url-mode MCP elicitation finished server-side. Let the client
@@ -1605,6 +1651,7 @@ export class ClaudeAcpAgent {
               case "model_refusal_fallback":
               case "model_refusal_no_fallback":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
+                await this.emitIgnoredSDKMessage(params.sessionId, session, message);
                 break;
               default:
                 unreachable(message, this.logger);
@@ -3466,6 +3513,10 @@ export class ClaudeAcpAgent {
       currentAgent,
       abortController,
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
+      // TEMP(debug): default-ON so the `_claude/sdkMessageIgnored` channel is
+      // always live during investigation. Revert to `?? false` (or remove the
+      // feature) when done. A client can still opt out with `_meta` = false.
+      emitIgnoredSDKMessages: sessionMeta?.claudeCode?.emitIgnoredSDKMessages ?? true,
       contextWindowSize:
         inferContextWindowFromModel(
           models.currentModelId,
