@@ -37,6 +37,7 @@ import {
   streamEventToAcpNotifications,
   messageIdForGrouping,
   buildConfigOptions,
+  createFastModeConfigOption,
   discoverCustomAgents,
   runPromptWithCancellation,
   type AcpClient,
@@ -118,6 +119,7 @@ function mockSessionState(overrides: Record<string, any> = {}) {
     contextWindowSize: 200000,
     taskState: new Map(),
     toolUseCache: {},
+    emittedToolCalls: new Set(),
     messageIdToUuid: new Map(),
     ...overrides,
   } as any;
@@ -1809,11 +1811,13 @@ describe("permission request cancellation", () => {
       configOptions: [],
       agents: [],
       currentAgent: "default",
+      fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
       taskState: new Map(),
       toolUseCache: {},
+      emittedToolCalls: new Set(),
       messageIdToUuid: new Map(),
     } as any;
     return agent.sessions[sessionId]!;
@@ -1835,7 +1839,11 @@ describe("permission request cancellation", () => {
       },
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
-    injectSession(agent, "session-1");
+    const session = injectSession(agent, "session-1");
+    // The tool_call was already surfaced by the streamed tool_use chunk, so the
+    // permission request goes straight to requestPermission without first
+    // emitting one.
+    session.emittedToolCalls.add("tool-1");
 
     const controller = new AbortController();
     const pending = agent.canUseTool("session-1")("Bash", { command: "ls" }, {
@@ -1869,6 +1877,136 @@ describe("permission request cancellation", () => {
         toolUseID: "tool-1",
       } as any),
     ).rejects.toThrow("Tool use aborted");
+  });
+});
+
+describe("tool_call emitted before permission request", () => {
+  // The SDK can invoke canUseTool before the assistant message's tool_use block
+  // streams to us. ACP clients expect the tool_call a permission request
+  // references to already exist, so the permission flow emits it eagerly and the
+  // streamed chunk later refines it with a tool_call_update (deduped via
+  // session.emittedToolCalls) rather than emitting a duplicate.
+  function setup(overrides: Record<string, any> = {}) {
+    const events: string[] = [];
+    const updates: SessionNotification[] = [];
+    const mockClient = {
+      sessionUpdate: async (n: SessionNotification) => {
+        events.push(`update:${n.update.sessionUpdate}`);
+        updates.push(n);
+      },
+      requestPermission: async () => {
+        events.push("permission");
+        return { outcome: { outcome: "selected", optionId: "allow" } };
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    agent.sessions["session-1"] = mockSessionState(overrides);
+    return { agent, events, updates, session: agent.sessions["session-1"]! };
+  }
+
+  it("emits the tool_call (then asks permission) when the stream hasn't yet", async () => {
+    const { agent, events, updates, session } = setup();
+
+    const result = await agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "tool-1",
+    } as any);
+
+    // tool_call is sent before the permission request is raised.
+    expect(events).toEqual(["update:tool_call", "permission"]);
+    expect(updates[0].update).toMatchObject({
+      sessionUpdate: "tool_call",
+      toolCallId: "tool-1",
+      status: "pending",
+    });
+    expect(session.emittedToolCalls.has("tool-1")).toBe(true);
+    expect(result).toMatchObject({ behavior: "allow" });
+  });
+
+  it("does not re-emit the tool_call when the stream already surfaced it", async () => {
+    const { agent, events } = setup();
+    agent.sessions["session-1"]!.emittedToolCalls.add("tool-1");
+
+    await agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "tool-1",
+    } as any);
+
+    expect(events).toEqual(["permission"]);
+  });
+
+  it("refines the eagerly-emitted tool_call with a tool_call_update when the chunk streams", () => {
+    const { session } = setup();
+    // Permission flow already emitted the tool_call for this id.
+    session.emittedToolCalls.add("tool-1");
+
+    const notifications = toAcpNotifications(
+      [{ type: "tool_use", id: "tool-1", name: "Bash", input: { command: "ls" } }],
+      "assistant",
+      "session-1",
+      session.toolUseCache,
+      {} as AcpClient,
+      console,
+      { emittedToolCalls: session.emittedToolCalls },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update.sessionUpdate).toBe("tool_call_update");
+  });
+
+  it("does not emit a tool_call for suppressed tools (TodoWrite) on a permission request", async () => {
+    const { agent, events, session } = setup();
+
+    await agent.canUseTool("session-1")(
+      "TodoWrite",
+      { todos: [{ content: "x", status: "pending" }] },
+      { signal: new AbortController().signal, suggestions: [], toolUseID: "todo-1" } as any,
+    );
+
+    expect(events).toEqual(["permission"]);
+    expect(session.emittedToolCalls.has("todo-1")).toBe(false);
+  });
+
+  it("includes Bash terminal_info _meta in the eager tool_call so terminal output can attach", async () => {
+    const { agent, updates } = setup();
+    // Terminal-capable client (e.g. Zed). The eager tool_call must carry
+    // terminal_info.terminal_id, otherwise the later terminal_output/terminal_exit
+    // updates (keyed by terminal_id) have nothing to attach to.
+    (agent as any).clientCapabilities = { _meta: { terminal_output: true } };
+
+    await agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "tool-1",
+    } as any);
+
+    expect(updates[0].update).toMatchObject({
+      sessionUpdate: "tool_call",
+      toolCallId: "tool-1",
+      _meta: { terminal_info: { terminal_id: "tool-1" } },
+    });
+  });
+
+  it("prunes the emission marker on a tool_result even when the tool_use was never cached", () => {
+    const { session } = setup();
+    // Eager-emitted via the permission flow, but the tool_use chunk never
+    // streamed (e.g. cancelled), so toolUseCache has no entry for it.
+    session.emittedToolCalls.add("tool-1");
+
+    toAcpNotifications(
+      [{ type: "tool_result", tool_use_id: "tool-1", content: [{ type: "text", text: "x" }] }],
+      "user",
+      "session-1",
+      session.toolUseCache,
+      {} as AcpClient,
+      // Silence the expected "tool result for tool use that wasn't tracked" log.
+      { log: () => {}, error: () => {} },
+      { emittedToolCalls: session.emittedToolCalls },
+    );
+
+    expect(session.emittedToolCalls.has("tool-1")).toBe(false);
   });
 });
 
@@ -2129,6 +2267,77 @@ describe("stop reason propagation", () => {
     // usage_update), not folded into the user turn's response.
     expect(response.usage?.inputTokens).toBe(promptResult.usage.input_tokens);
     expect(response.usage?.outputTokens).toBe(promptResult.usage.output_tokens);
+  });
+
+  it("only reconciles Fast mode from user-driven results, not task-notification followups", async () => {
+    const updates: any[] = [];
+    const mockClient = {
+      sessionUpdate: async (n: any) => {
+        updates.push(n);
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    (agent as any).clientCapabilities = { session: { configOptions: { boolean: {} } } };
+
+    const input = new Pushable<any>();
+
+    // A background followup reports fast_mode_state="on". It must NOT flip the
+    // user's toggle or emit a config_option_update (every other side effect in
+    // the result handler is likewise gated behind !isTaskNotification).
+    const backgroundTaskResult = {
+      ...createResultMessage({ subtype: "success", stop_reason: null, is_error: false }),
+      origin: { kind: "task-notification" },
+      fast_mode_state: "on",
+    };
+
+    // The user prompt's own result reports the same state — this one IS a user
+    // turn, so it reconciles and notifies.
+    const promptResult = {
+      ...createResultMessage({ subtype: "success", stop_reason: null, is_error: false }),
+      fast_mode_state: "on",
+    };
+
+    async function* messageGenerator() {
+      yield { type: "system", subtype: "init", session_id: "test-session" };
+      yield backgroundTaskResult;
+
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield {
+        type: "user",
+        message: userMessage.message,
+        parent_tool_use_id: null,
+        uuid: userMessage.uuid,
+        session_id: "test-session",
+        isReplay: true,
+      };
+
+      yield promptResult;
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+      fastModeEnabled: false,
+      configOptions: [createFastModeConfigOption(false, true)],
+    });
+
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    // The user-turn result flipped the toggle and emitted exactly one
+    // config_option_update; the background result contributed none.
+    expect((agent.sessions["test-session"] as any).fastModeEnabled).toBe(true);
+    const configUpdates = updates.filter(
+      (n: any) => n.update?.sessionUpdate === "config_option_update",
+    );
+    expect(configUpdates).toHaveLength(1);
+    expect(configUpdates[0].update.configOptions).toContainEqual(
+      createFastModeConfigOption(true, true),
+    );
   });
 
   it("does not fold a task-notification result's tokens into an already-active turn's usage", async () => {
@@ -2577,11 +2786,13 @@ describe("session/close", () => {
       configOptions: [],
       agents: [],
       currentAgent: "default",
+      fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
       taskState: new Map(),
       toolUseCache: {},
+      emittedToolCalls: new Set(),
       messageIdToUuid: new Map(),
     };
     return agent.sessions[sessionId]!;
@@ -2662,11 +2873,13 @@ describe("session/delete", () => {
       configOptions: [],
       agents: [],
       currentAgent: "default",
+      fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
       taskState: new Map(),
       toolUseCache: {},
+      emittedToolCalls: new Set(),
       messageIdToUuid: new Map(),
     };
     return agent.sessions[sessionId]!;
@@ -2764,11 +2977,13 @@ describe("getOrCreateSession param change detection", () => {
       configOptions: [],
       agents: [],
       currentAgent: "default",
+      fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
       taskState: new Map(),
       toolUseCache: {},
+      emittedToolCalls: new Set(),
       messageIdToUuid: new Map(),
     };
     return agent.sessions[sessionId]!;
@@ -4980,11 +5195,13 @@ describe("post-error recovery", () => {
       configOptions: [],
       agents: [],
       currentAgent: "default",
+      fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
       taskState: new Map(),
       toolUseCache: {},
+      emittedToolCalls: new Set(),
       messageIdToUuid: new Map(),
     };
     return { interrupt };
@@ -5550,11 +5767,13 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       configOptions: [],
       agents: [],
       currentAgent: "default",
+      fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
       taskState: new Map(),
       toolUseCache: {},
+      emittedToolCalls: new Set(),
       messageIdToUuid: new Map(),
     };
     return { interrupt };
@@ -6003,11 +6222,13 @@ describe("agent selection config option", () => {
         configOptions: buildConfigOptions(baseModes, baseModels, [], undefined, agents, "default"),
         agents,
         currentAgent: "default",
+        fastModeEnabled: false,
         abortController: new AbortController(),
         emitRawSDKMessages: false,
         contextWindowSize: 200000,
         taskState: new Map(),
         toolUseCache: {},
+        emittedToolCalls: new Set(),
         messageIdToUuid: new Map(),
       };
       return { session: agent.sessions[sessionId]!, applyFlagSettings };
