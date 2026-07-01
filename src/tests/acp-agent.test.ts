@@ -2135,6 +2135,44 @@ describe("stop reason propagation", () => {
     });
   }
 
+  function taskStarted(taskId: string, description = "Explore repo") {
+    return {
+      type: "system",
+      subtype: "task_started",
+      task_id: taskId,
+      description,
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+  }
+
+  function taskUpdated(taskId: string, status: "completed" | "failed" | "killed" = "completed") {
+    return {
+      type: "system",
+      subtype: "task_updated",
+      task_id: taskId,
+      patch: { status },
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+  }
+
+  function taskNotification(
+    taskId: string,
+    status: "completed" | "failed" | "stopped" = "completed",
+  ) {
+    return {
+      type: "system",
+      subtype: "task_notification",
+      task_id: taskId,
+      status,
+      output_file: `/tmp/${taskId}.txt`,
+      summary: "done",
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+  }
+
   it("should return max_tokens when success result has stop_reason max_tokens", async () => {
     const agent = createMockAgent();
     injectSession(agent, [
@@ -2469,6 +2507,126 @@ describe("stop reason propagation", () => {
     // Releasing the idle lets the consumer drain cleanly without double-settling.
     releaseIdle();
     await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("waits for background SDK tasks and the follow-up idle before resolving end_turn", async () => {
+    const agent = createMockAgent();
+    let releaseFirstTask!: () => void;
+    let releaseSecondTask!: () => void;
+    let releaseIdle!: () => void;
+    let resultYielded!: () => void;
+    let firstTaskYielded!: () => void;
+    let secondTaskYielded!: () => void;
+    const firstTaskGate = new Promise<void>((resolve) => (releaseFirstTask = resolve));
+    const secondTaskGate = new Promise<void>((resolve) => (releaseSecondTask = resolve));
+    const idleGate = new Promise<void>((resolve) => (releaseIdle = resolve));
+    const afterResult = new Promise<void>((resolve) => (resultYielded = resolve));
+    const afterFirstTask = new Promise<void>((resolve) => (firstTaskYielded = resolve));
+    const afterSecondTask = new Promise<void>((resolve) => (secondTaskYielded = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield taskStarted("task-1");
+        yield taskStarted("task-2", "Run checks");
+        yield createResultMessage({
+          subtype: "success",
+          stop_reason: "end_turn",
+          is_error: false,
+        });
+        resultYielded();
+
+        await firstTaskGate;
+        yield taskUpdated("task-1");
+        firstTaskYielded();
+
+        await secondTaskGate;
+        yield taskNotification("task-2");
+        secondTaskYielded();
+
+        await idleGate;
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    let settled = false;
+    const promptPromise = agent
+      .prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "test" }],
+      })
+      .then((response) => {
+        settled = true;
+        return response;
+      });
+
+    await afterResult;
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(settled).toBe(false);
+
+    releaseFirstTask();
+    await afterFirstTask;
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(settled).toBe(false);
+
+    releaseSecondTask();
+    await afterSecondTask;
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(settled).toBe(false);
+
+    releaseIdle();
+    const response = await promptPromise;
+    expect(response.stopReason).toBe("end_turn");
+  });
+
+  it("waits for idle when a background SDK task completes before the top-level result", async () => {
+    const agent = createMockAgent();
+    let releaseIdle!: () => void;
+    let resultYielded!: () => void;
+    const idleGate = new Promise<void>((resolve) => (releaseIdle = resolve));
+    const afterResult = new Promise<void>((resolve) => (resultYielded = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield taskStarted("task-1");
+        yield taskUpdated("task-1");
+        yield createResultMessage({
+          subtype: "success",
+          stop_reason: "end_turn",
+          is_error: false,
+        });
+        resultYielded();
+
+        await idleGate;
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    let settled = false;
+    const promptPromise = agent
+      .prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "test" }],
+      })
+      .then((response) => {
+        settled = true;
+        return response;
+      });
+
+    await afterResult;
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(settled).toBe(false);
+
+    releaseIdle();
+    const response = await promptPromise;
+    expect(response.stopReason).toBe("end_turn");
   });
 
   it("forwards background output that arrives after the turn resolves (issue #679)", async () => {
@@ -4651,6 +4809,84 @@ describe("emitRawSDKMessages", () => {
     // Other extension notifications, such as usage updates, may share the same transport.
     const sdkMessages = extNotifications.filter((n) => n.method === "_claude/sdkMessage");
     expect(sdkMessages.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("emits task lifecycle notifications with full task payloads", async () => {
+    const { agent, extNotifications } = createMockAgentWithExtNotification();
+    const taskStarted = {
+      type: "system" as const,
+      subtype: "task_started" as const,
+      task_id: "task-1",
+      tool_use_id: "tool-1",
+      description: "Find CLI startup behavior",
+      subagent_type: "Explore",
+      task_type: "local_agent",
+      prompt: "full prompt that downstream may filter",
+      uuid: randomUUID(),
+      session_id: "sdk-session",
+    };
+    const taskProgress = {
+      type: "system" as const,
+      subtype: "task_progress" as const,
+      task_id: "task-1",
+      tool_use_id: "tool-1",
+      description: "Reading apps/cli/src/commands/start.ts",
+      subagent_type: "Explore",
+      usage: { total_tokens: 100, tool_uses: 2, duration_ms: 500 },
+      last_tool_name: "Read",
+      uuid: randomUUID(),
+      session_id: "sdk-session",
+    };
+    const taskUpdated = {
+      type: "system" as const,
+      subtype: "task_updated" as const,
+      task_id: "task-1",
+      patch: { status: "completed" },
+      uuid: randomUUID(),
+      session_id: "sdk-session",
+    };
+    const taskNotification = {
+      type: "system" as const,
+      subtype: "task_notification" as const,
+      task_id: "task-1",
+      tool_use_id: "tool-1",
+      status: "completed" as const,
+      output_file: "/tmp/task-1.output",
+      summary: "Agent finished",
+      usage: { total_tokens: 123, tool_uses: 3, duration_ms: 700 },
+      uuid: randomUUID(),
+      session_id: "sdk-session",
+    };
+    injectSession(
+      agent,
+      [
+        taskStarted,
+        taskProgress,
+        taskUpdated,
+        taskNotification,
+        createResultMessage(),
+        { type: "system", subtype: "session_state_changed", state: "idle" },
+      ],
+      false,
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const taskLifecycle = extNotifications.filter((n) => n.method === "_claude/taskLifecycle");
+    expect(taskLifecycle).toHaveLength(4);
+    expect(taskLifecycle.map((n) => n.params.message.subtype)).toEqual([
+      "task_started",
+      "task_progress",
+      "task_updated",
+      "task_notification",
+    ]);
+    expect(taskLifecycle[0].params).toEqual({
+      sessionId: "test-session",
+      acpSessionId: "sdk-session",
+      message: taskStarted,
+    });
+    expect(taskLifecycle[3].params.message).toEqual(taskNotification);
+    expect(extNotifications.filter((n) => n.method === "_claude/sdkMessage")).toHaveLength(0);
   });
 
   it("does not emit when set to false", async () => {

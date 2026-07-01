@@ -165,6 +165,7 @@ const ZERO_USAGE = Object.freeze({
 });
 
 const DEFAULT_CONTEXT_WINDOW = 200000;
+const CLAUDE_TASK_LIFECYCLE_METHOD = "_claude/taskLifecycle";
 
 /** Floor after `session/cancel` before the adapter forces the active prompt
  *  loop to return "cancelled". `query.interrupt()` normally makes the SDK
@@ -202,6 +203,19 @@ type Turn = {
   /** Set once the deferred has been resolved/rejected, so the consumer never
    *  settles a turn twice (idle + handoff + stream-end can all race). */
   settled: boolean;
+  /** Background SDK tasks that were started while this turn was active and
+   *  have not yet emitted a terminal lifecycle event. */
+  pendingTaskIds: Set<string>;
+  /** Whether this turn started any visible background SDK task. Even if the
+   *  task reaches a terminal state before the top-level result, the turn should
+   *  still wait for the following idle drain marker. */
+  startedBackgroundTask: boolean;
+  /** Terminal prompt response captured at the top-level result while the turn
+   *  is still waiting for its background tasks / follow-up drain to finish. */
+  pendingCompletion?: PromptResponse;
+  /** True after a turn has reached its top-level result with tasks still
+   *  running. Once the tasks finish, the next SDK idle is the safe drain point. */
+  waitForBackgroundIdle: boolean;
   resolve: (response: PromptResponse) => void;
   reject: (error: unknown) => void;
 };
@@ -225,6 +239,9 @@ type Session = {
    *  the genuine head untouched. Reset to 0 on every activation as a backstop
    *  against an SDK that drops queued input on interrupt (no orphan emitted). */
   pendingOrphanResults?: number;
+  /** Owner turn for SDK background task IDs. Lets task lifecycle events settle
+   *  the prompt that spawned them even if a later prompt is already active. */
+  taskOwners?: Map<string, Turn>;
   /** The long-lived consumer task. Lazily started on the first `prompt()` and
    *  kept alive for the session so between-turn/background messages are still
    *  drained and forwarded. */
@@ -1072,6 +1089,9 @@ export class ClaudeAcpAgent {
       promptUuid,
       isLocalOnlyCommand,
       settled: false,
+      pendingTaskIds: new Set(),
+      startedBackgroundTask: false,
+      waitForBackgroundIdle: false,
       resolve: () => {},
       reject: () => {},
     };
@@ -1209,7 +1229,7 @@ export class ClaudeAcpAgent {
       if (session.activeTurn) {
         return;
       }
-      const head = (session.turnQueue ?? []).find((t) => !t.settled);
+      const head = (session.turnQueue ?? []).find((t) => !t.settled && !t.pendingCompletion);
       if (!head) {
         return;
       }
@@ -1220,21 +1240,122 @@ export class ClaudeAcpAgent {
       activateTurn(head);
     };
 
-    /** Settle the active turn's deferred exactly once, disarm the force-cancel
-     *  backstop (the turn is over), and drop it from the queue. */
+    const clearTurnTaskTracking = (turn: Turn) => {
+      if (session.taskOwners) {
+        for (const taskId of turn.pendingTaskIds) {
+          if (session.taskOwners.get(taskId) === turn) {
+            session.taskOwners.delete(taskId);
+          }
+        }
+      }
+      turn.pendingTaskIds.clear();
+    };
+
+    /** Settle a turn's deferred exactly once and drop it from the queue. The
+     *  turn may be the active one or an earlier turn waiting for background
+     *  tasks to drain while a later queued prompt is already active. */
+    const settleTurn = (turn: Turn, result: PromptResponse) => {
+      if (turn.settled) {
+        return;
+      }
+      turn.settled = true;
+      if (session.activeTurn === turn && session.forceCancelTimer) {
+        clearTimeout(session.forceCancelTimer);
+        session.forceCancelTimer = undefined;
+      }
+      clearTurnTaskTracking(turn);
+      turn.startedBackgroundTask = false;
+      turn.pendingCompletion = undefined;
+      turn.waitForBackgroundIdle = false;
+      session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== turn);
+      if (session.activeTurn === turn) {
+        session.activeTurn = null;
+      }
+      turn.resolve(result);
+    };
+
+    /** Settle the active turn, if there is one. */
     const settleActive = (result: PromptResponse) => {
+      const turn = session.activeTurn;
+      if (!turn) {
+        return;
+      }
+      settleTurn(turn, result);
+    };
+
+    const deferActiveUntilBackgroundDrain = (result: PromptResponse) => {
       const turn = session.activeTurn;
       if (!turn || turn.settled) {
         return;
       }
-      turn.settled = true;
-      if (session.forceCancelTimer) {
-        clearTimeout(session.forceCancelTimer);
-        session.forceCancelTimer = undefined;
+      if (!turn.startedBackgroundTask) {
+        settleTurn(turn, result);
+        return;
       }
-      session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== turn);
-      session.activeTurn = null;
-      turn.resolve(result);
+      turn.pendingCompletion = result;
+      turn.waitForBackgroundIdle = true;
+    };
+
+    const settleBackgroundIdleWaiters = () => {
+      for (const turn of [...(session.turnQueue ?? [])]) {
+        if (
+          !turn.settled &&
+          turn.pendingCompletion &&
+          turn.waitForBackgroundIdle &&
+          turn.pendingTaskIds.size === 0
+        ) {
+          settleTurn(turn, turn.pendingCompletion);
+        }
+      }
+    };
+
+    const settlePendingCompletions = () => {
+      for (const turn of [...(session.turnQueue ?? [])]) {
+        if (!turn.settled && turn.pendingCompletion) {
+          settleTurn(turn, turn.pendingCompletion);
+        }
+      }
+    };
+
+    const trackBackgroundTask = (taskId: string, options?: { skipTranscript?: boolean }) => {
+      const turn = session.activeTurn;
+      // Ambient housekeeping tasks are not part of the visible assistant turn;
+      // waiting on them would make hidden title/index work delay end_turn.
+      if (!turn || turn.settled || options?.skipTranscript) {
+        return;
+      }
+      turn.pendingTaskIds.add(taskId);
+      turn.startedBackgroundTask = true;
+      session.taskOwners ??= new Map();
+      session.taskOwners.set(taskId, turn);
+    };
+
+    const finishBackgroundTask = (taskId: string) => {
+      const turn = session.taskOwners?.get(taskId);
+      if (!turn || turn.settled) {
+        return;
+      }
+      turn.pendingTaskIds.delete(taskId);
+      session.taskOwners?.delete(taskId);
+      // The terminal task event is not quite the safe end of the turn: the SDK
+      // may still emit task-notification follow-up output. The next idle is the
+      // drain marker for turns that had to wait on background work.
+    };
+
+    const emitTaskLifecycle = async (message: SDKMessage) => {
+      const extNotification = this.client.extNotification?.bind(this.client);
+      if (!extNotification) {
+        return;
+      }
+      const acpSessionId =
+        "session_id" in message && typeof message.session_id === "string"
+          ? message.session_id
+          : params.sessionId;
+      await extNotification(CLAUDE_TASK_LIFECYCLE_METHOD, {
+        sessionId: params.sessionId,
+        acpSessionId,
+        message: message as unknown as Record<string, unknown>,
+      });
     };
 
     /** Reject the active turn (auth required, error result, …) without tearing
@@ -1249,6 +1370,10 @@ export class ClaudeAcpAgent {
         return;
       }
       turn.settled = true;
+      clearTurnTaskTracking(turn);
+      turn.startedBackgroundTask = false;
+      turn.pendingCompletion = undefined;
+      turn.waitForBackgroundIdle = false;
       session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== turn);
       session.activeTurn = null;
       turn.reject(error);
@@ -1268,6 +1393,10 @@ export class ClaudeAcpAgent {
       for (const turn of turns) {
         if (!turn.settled) {
           turn.settled = true;
+          clearTurnTaskTracking(turn);
+          turn.startedBackgroundTask = false;
+          turn.pendingCompletion = undefined;
+          turn.waitForBackgroundIdle = false;
           turn.reject(error);
         }
       }
@@ -1320,6 +1449,7 @@ export class ClaudeAcpAgent {
           //
           // Settle the turn that was in flight so its prompt() doesn't hang:
           // cancelled if a cancel is pending, otherwise the accumulated outcome.
+          settlePendingCompletions();
           settleActive(
             session.cancelled
               ? { stopReason: "cancelled" }
@@ -1446,19 +1576,21 @@ export class ClaudeAcpAgent {
               }
               case "session_state_changed": {
                 if (message.state === "idle") {
-                  // A non-cancelled turn already settled at its terminal
-                  // `result` (issue #773), so this trailing `idle` is just
-                  // absorbed. We must NOT settle `activeTurn` here in that case:
-                  // `idle` carries no turn identity, and it can lag (the SDK
-                  // flushes held-back results / drains background agents first),
-                  // so by the time it arrives the SDK may have echoed the NEXT
-                  // turn and activated it — settling now would resolve that new
-                  // turn prematurely with end_turn and ~zero usage, dropping its
-                  // real result. Only a cancelled turn relies on `idle`: its
-                  // `result` is dropped at the `session.cancelled` guard, so it
-                  // never settles at a result and must settle here.
+                  // Most non-cancelled turns settle at their terminal `result`
+                  // (issue #773), so a trailing `idle` is usually just
+                  // absorbed. Turns that reached `result` with background SDK
+                  // tasks still running are different: the SDK may emit
+                  // task-notification follow-up output after the task terminal
+                  // event, and `idle` is the drain marker for that work.
+                  //
+                  // Do not use a bare activeTurn here: `idle` carries no turn
+                  // identity and can lag behind the next prompt's echo. Only
+                  // release turns that explicitly recorded a pending completion
+                  // while waiting for background task drain.
                   if (session.cancelled) {
                     settleActive({ stopReason: "cancelled" });
+                  } else {
+                    settleBackgroundIdleWaiters();
                   }
                   // The SDK generates the session title in a background task and
                   // persists it to the session file; `idle` is the turn-over
@@ -1590,10 +1722,27 @@ export class ClaudeAcpAgent {
               case "hook_progress":
               case "hook_response":
               case "files_persisted":
+                break;
               case "task_started":
+                await emitTaskLifecycle(message);
+                trackBackgroundTask(message.task_id, { skipTranscript: message.skip_transcript });
+                break;
               case "task_notification":
+                await emitTaskLifecycle(message);
+                finishBackgroundTask(message.task_id);
+                break;
               case "task_progress":
+                await emitTaskLifecycle(message);
+                break;
               case "task_updated":
+                await emitTaskLifecycle(message);
+                if (
+                  message.patch.status === "completed" ||
+                  message.patch.status === "failed" ||
+                  message.patch.status === "killed"
+                ) {
+                  finishBackgroundTask(message.task_id);
+                }
                 break;
               case "worker_shutting_down":
                 // A Remote Control worker announced a graceful teardown. This is a
@@ -1755,7 +1904,10 @@ export class ClaudeAcpAgent {
                 });
               }
               stopReason = "refusal";
-              settleActive({ stopReason: "refusal", usage: sessionUsage(session) });
+              deferActiveUntilBackgroundDrain({
+                stopReason: "refusal",
+                usage: sessionUsage(session),
+              });
               break;
             }
 
@@ -1836,15 +1988,15 @@ export class ClaudeAcpAgent {
                 unreachable(message, this.logger);
                 break;
             }
-            // Settle the user turn at its terminal result so the client unlocks
-            // as soon as the answer is done, rather than waiting for the SDK's
-            // trailing `idle` (which can lag while background work runs — issue
-            // #773). The consumer keeps draining afterward (absorbing idle and
-            // forwarding any background output). is_error/auth already settled
-            // via failActive; cancellation is left to the idle/abort path.
-            // settleActive is idempotent, so a duplicate idle is a no-op.
+            // Settle ordinary user turns at their terminal result so the client
+            // unlocks without waiting for a lagging trailing `idle` (issue
+            // #773). If this turn started background SDK tasks that are still
+            // running, hold the response until those tasks complete and the SDK
+            // emits a follow-up `idle` drain marker. is_error/auth already
+            // settled via failActive; cancellation is left to the idle/abort
+            // path.
             if (!isTaskNotification && !session.cancelled) {
-              settleActive({ stopReason, usage: sessionUsage(session) });
+              deferActiveUntilBackgroundDrain({ stopReason, usage: sessionUsage(session) });
             }
             break;
           }
@@ -2003,11 +2155,26 @@ export class ClaudeAcpAgent {
                     // "cancelled" per the ACP contract rather than "end_turn" —
                     // otherwise a cancel followed quickly by the next prompt
                     // would report the cancelled turn as a normal completion.
-                    settleActive(
-                      session.cancelled
-                        ? { stopReason: "cancelled" }
-                        : { stopReason: "end_turn", usage: sessionUsage(session) },
-                    );
+                    const previous = session.activeTurn;
+                    if (session.cancelled) {
+                      settleTurn(previous, { stopReason: "cancelled" });
+                    } else if (
+                      previous.pendingCompletion ||
+                      previous.pendingTaskIds.size > 0 ||
+                      previous.startedBackgroundTask
+                    ) {
+                      previous.pendingCompletion ??= {
+                        stopReason: "end_turn",
+                        usage: sessionUsage(session),
+                      };
+                      previous.waitForBackgroundIdle = true;
+                      session.activeTurn = null;
+                    } else {
+                      settleTurn(previous, {
+                        stopReason: "end_turn",
+                        usage: sessionUsage(session),
+                      });
+                    }
                   }
                   activateTurn(queued);
                 }
@@ -2303,6 +2470,17 @@ export class ClaudeAcpAgent {
       for (const turn of session.turnQueue) {
         if (turn !== session.activeTurn && !turn.settled) {
           turn.settled = true;
+          if (session.taskOwners) {
+            for (const taskId of turn.pendingTaskIds) {
+              if (session.taskOwners.get(taskId) === turn) {
+                session.taskOwners.delete(taskId);
+              }
+            }
+          }
+          turn.pendingTaskIds.clear();
+          turn.startedBackgroundTask = false;
+          turn.pendingCompletion = undefined;
+          turn.waitForBackgroundIdle = false;
           turn.resolve({ stopReason: "cancelled" });
           orphaned++;
         }
