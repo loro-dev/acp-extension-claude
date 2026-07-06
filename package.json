@@ -1,6 +1,6 @@
 {
   "name": "acp-extension-claude",
-  "version": "0.54.3",
+  "version": "0.54.4",
   "description": "Forked ACP-compatible coding agent with improved timeout handling and logging",
   "main": "dist/lib.js",
   "types": "dist/lib.d.ts",
@@ -52,7 +52,7 @@
     "node": ">=22"
   },
   "dependencies": {
-    "acp-extension-core": "workspace:*",
+    "acp-extension-core": "0.0.5",
     "@agentclientprotocol/sdk": "1.1.0",
     "@anthropic-ai/claude-agent-sdk": "0.3.197",
     "zod": "^4.0.0"
