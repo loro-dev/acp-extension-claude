@@ -59,6 +59,7 @@ import {
   ModelInfo,
   ModelUsage,
   OnElicitation,
+  OnUserDialog,
   Options,
   PermissionMode,
   PermissionResult,
@@ -90,7 +91,11 @@ import {
   createElicitationResponseToElicitResult,
   ElicitationSupport,
   extractAskUserQuestions,
+  extractRefusalFallbackPrompt,
   mcpElicitationToCreateRequest,
+  REFUSAL_FALLBACK_DIALOG_KIND,
+  refusalFallbackResultFromResponse,
+  refusalFallbackToCreateRequest,
 } from "./elicitation.js";
 import { SettingsManager } from "./settings.js";
 import {
@@ -177,6 +182,14 @@ const CLAUDE_TASK_LIFECYCLE_METHOD = "_claude/taskLifecycle";
  *  "obviously stuck" ceiling, not a guess at interrupt latency, so it can't
  *  pre-empt a slow-but-healthy interrupt. */
 const DEFAULT_FORCE_CANCEL_GRACE_MS = 30_000;
+
+/** Error surfaced when the SDK declares a turn over (`session_state_changed:
+ *  idle`, its authoritative turn-over signal) without ever emitting the turn's
+ *  `result` — a model stream that dropped mid-turn, or an async agent that
+ *  completed/stalled without the host turn resolving (issue #825). */
+const TURN_NO_RESULT_MESSAGE =
+  "The turn ended without a result: the agent went idle while this prompt was still in flight " +
+  "(e.g. the model stream dropped mid-turn). Any partial output may be incomplete; please retry.";
 
 /** Internal model-selection state. Mirrors the shape the ACP SDK exposed as
  *  `SessionModelState` before model selection moved entirely into
@@ -588,6 +601,9 @@ export function isLocalCommandMetadata(content: unknown): boolean {
 const PERMISSION_MODE_ALIASES: Record<string, PermissionMode> = {
   auto: "auto",
   default: "default",
+  // Claude Code 2.1.200 renamed the "default" mode to "Manual" and accepts
+  // `"defaultMode": "manual"` in settings.json; honor the same alias here.
+  manual: "default",
   acceptedits: "acceptEdits",
   dontask: "dontAsk",
   plan: "plan",
@@ -1170,6 +1186,20 @@ export class ClaudeAcpAgent {
     // Stop reason accumulated for the active turn (result subtype, refusal,
     // max_tokens, …). Reset per turn; read when the turn settles at idle.
     let stopReason: StopReason = "end_turn";
+    // How many trailing `session_state_changed: idle` messages are already
+    // accounted for: every user-turn result that terminates a turn (settle,
+    // reject, or orphan skip) is followed by one, as is a cancelled turn
+    // settled by the next turn's echo hand-off. The idle handler absorbs owed
+    // idles; an idle that arrives when NONE is owed while the active turn is
+    // still unsettled means the SDK ended the turn without ever emitting its
+    // result, so the turn will never settle on its own (issue #825).
+    // Stream-level debt, deliberately NOT reset per turn: a lagged idle can
+    // arrive after the next turn has already activated (issue #773), and the
+    // debt is what attributes it to the turn that owed it. Over-counting (an
+    // idle the SDK never emits, e.g. CLI binaries without session-state
+    // events — issue #497) is benign: the counter just absorbs one future
+    // idle, and detection degrades to the status quo rather than misfiring.
+    let owedTrailingIdles = 0;
 
     const resetTurnScratch = () => {
       lastAssistantTotalUsage = null;
@@ -1294,9 +1324,17 @@ export class ClaudeAcpAgent {
       }
       turn.pendingCompletion = result;
       turn.waitForBackgroundIdle = true;
+      // This turn's trailing idle is the drain marker that will release the
+      // pending completion, not an owed idle to absorb for an already-settled
+      // turn. Result handling pre-counts the idle for #825 protection, so take
+      // that count back when the completion is intentionally deferred.
+      if (owedTrailingIdles > 0) {
+        owedTrailingIdles--;
+      }
     };
 
     const settleBackgroundIdleWaiters = () => {
+      let settledAny = false;
       for (const turn of [...(session.turnQueue ?? [])]) {
         if (
           !turn.settled &&
@@ -1305,8 +1343,10 @@ export class ClaudeAcpAgent {
           turn.pendingTaskIds.size === 0
         ) {
           settleTurn(turn, turn.pendingCompletion);
+          settledAny = true;
         }
       }
+      return settledAny;
     };
 
     const settlePendingCompletions = () => {
@@ -1407,9 +1447,21 @@ export class ClaudeAcpAgent {
     // after each fire so the consumer keeps serving later turns.
     let cancelController = session.cancelController!;
 
+    // The in-flight query.next(), kept across abort wake-ups that don't
+    // consume a message, so no yielded message is ever dropped — async
+    // generators serialize next() calls, so racing a SECOND next() while one
+    // is pending would make the abandoned one swallow a message (e.g. a
+    // force-cancelled turn's late result, whose orphan accounting below
+    // depends on actually seeing it).
+    let pendingNext: Promise<{ kind: "message"; result: IteratorResult<SDKMessage, void> }> | null =
+      null;
+
     try {
       while (true) {
-        const nextMessage = session.query.next();
+        pendingNext ??= session.query
+          .next()
+          .then((result) => ({ kind: "message" as const, result }));
+        const nextMessage = pendingNext;
         // Fresh abort listener per iteration, removed when next() wins, so a
         // long-lived session doesn't accumulate listeners on one signal.
         let onAbort!: () => void;
@@ -1417,26 +1469,38 @@ export class ClaudeAcpAgent {
           onAbort = () => resolve("abort");
           cancelController.signal.addEventListener("abort", onAbort, { once: true });
         });
-        const raced = await Promise.race([
-          nextMessage.then((result) => ({ kind: "message" as const, result })),
-          abortRace,
-        ]);
+        const raced = await Promise.race([nextMessage, abortRace]);
         cancelController.signal.removeEventListener("abort", onAbort);
 
         if (raced === "abort") {
-          // cancel()/teardown woke us. Abandon the in-flight next() (swallowing
-          // any later rejection so it can't surface as unhandled) and settle the
-          // active turn "cancelled" per the ACP contract. If the session is
-          // being torn down, stop; otherwise re-arm and keep consuming.
-          void nextMessage.catch(() => {});
+          // cancel()/teardown woke us: settle the active turn "cancelled" per
+          // the ACP contract. The SDK never acknowledged this turn (that's why
+          // the force-cancel backstop fired), so if it later recovers from the
+          // wedge it will still emit the turn's result — with no live turn to
+          // match — followed by its trailing idle. Pre-count it as an orphan
+          // so that late result is skipped (not promoted onto the next queued
+          // prompt) and its trailer is recorded as owed, not read as the next
+          // turn being abandoned. Stale counts self-heal: activation resets
+          // them (see activateTurn).
+          if (session.activeTurn && !session.activeTurn.settled) {
+            session.pendingOrphanResults = (session.pendingOrphanResults ?? 0) + 1;
+          }
           settleActive({ stopReason: "cancelled" });
+          // If the session is being torn down, abandon the in-flight next()
+          // (swallowing any later rejection so it can't surface as unhandled)
+          // and stop; otherwise re-arm and keep consuming — `pendingNext`
+          // stays in flight so its eventual message is processed, not dropped.
           if (!this.sessions[params.sessionId]) {
+            void nextMessage.catch(() => {});
             return;
           }
           cancelController = new AbortController();
           session.cancelController = cancelController;
           continue;
         }
+
+        // A message arrived: this next() is consumed; arm a fresh one next pass.
+        pendingNext = null;
 
         const { value: message, done } = raced.result as IteratorResult<SDKMessage, void>;
 
@@ -1576,21 +1640,41 @@ export class ClaudeAcpAgent {
               }
               case "session_state_changed": {
                 if (message.state === "idle") {
-                  // Most non-cancelled turns settle at their terminal `result`
-                  // (issue #773), so a trailing `idle` is usually just
-                  // absorbed. Turns that reached `result` with background SDK
-                  // tasks still running are different: the SDK may emit
-                  // task-notification follow-up output after the task terminal
-                  // event, and `idle` is the drain marker for that work.
+                  // Most turns settle at their terminal `result` (issue #773),
+                  // and those results record owed trailing idles that are
+                  // absorbed here. Turns that reached `result` with background
+                  // SDK tasks still running are different: their response is
+                  // intentionally held until task terminal events and this idle
+                  // drain marker arrive.
                   //
-                  // Do not use a bare activeTurn here: `idle` carries no turn
-                  // identity and can lag behind the next prompt's echo. Only
-                  // release turns that explicitly recorded a pending completion
-                  // while waiting for background task drain.
-                  if (session.cancelled) {
+                  // An idle that is neither owed nor a background drain while
+                  // the active turn is still unsettled is the issue #825
+                  // signature: the SDK declared the turn over without emitting
+                  // its result, so fail the in-flight prompt instead of leaving
+                  // it hanging.
+                  if (session.cancelled && session.activeTurn && !session.activeTurn.settled) {
                     settleActive({ stopReason: "cancelled" });
-                  } else {
-                    settleBackgroundIdleWaiters();
+                  } else if (owedTrailingIdles > 0) {
+                    owedTrailingIdles--;
+                  } else if (settleBackgroundIdleWaiters()) {
+                    // The idle was consumed as the drain marker for a deferred
+                    // background-task completion.
+                  } else if (
+                    !session.cancelled &&
+                    session.activeTurn &&
+                    !session.activeTurn.settled &&
+                    !session.activeTurn.pendingCompletion
+                  ) {
+                    this.logger.error(
+                      `Session ${params.sessionId}: SDK went idle without emitting a result ` +
+                        `for the active turn; failing the in-flight prompt (issue #825)`,
+                    );
+                    failActive(
+                      RequestError.internalError(
+                        errorKindData("no_result"),
+                        TURN_NO_RESULT_MESSAGE,
+                      ),
+                    );
                   }
                   // The SDK generates the session title in a background task and
                   // persists it to the session file; `idle` is the turn-over
@@ -1768,9 +1852,68 @@ export class ClaudeAcpAgent {
               case "notification":
               case "api_retry":
               case "thinking_tokens":
-              case "model_refusal_fallback":
-              case "model_refusal_no_fallback":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
+                break;
+              case "model_refusal_fallback": {
+                // The SDK retried a refused turn on the fallback model and made
+                // the swap persistent for the session. Without a notice the
+                // user just sees regenerated output; without the state sync the
+                // client's model picker (and the model-dependent options
+                // rebuilt from it) keeps advertising a model the session is no
+                // longer running.
+                //
+                // Current CLIs only emit direction "retry" (persistent swap).
+                // "revert"/"sticky" are retained in the SDK enum for older
+                // CLIs, where "revert" marked a turn-only fallback — for that
+                // direction the session stays on the original model, so skip
+                // the persistent-swap claim and the state sync.
+                const persistent = message.direction !== "revert";
+                const category = message.api_refusal_category
+                  ? ` (${message.api_refusal_category})`
+                  : "";
+                const explanation = message.api_refusal_explanation
+                  ? `\n\n${message.api_refusal_explanation}`
+                  : "";
+                const outcome = persistent
+                  ? `The session will continue on ${message.fallback_model}.`
+                  : `The session stays on ${message.original_model}.`;
+                await this.client.sessionUpdate({
+                  sessionId: message.session_id,
+                  update: {
+                    sessionUpdate: "agent_message_chunk",
+                    content: {
+                      type: "text",
+                      text: `**Model fallback:** ${message.original_model} declined this request${category}; retried with ${message.fallback_model}. ${outcome}${explanation}`,
+                    },
+                  },
+                });
+                if (persistent) {
+                  await this.syncModelAfterRefusalFallback(
+                    params.sessionId,
+                    session,
+                    message.fallback_model,
+                  );
+                }
+                break;
+              }
+              case "model_refusal_no_fallback":
+                // The refusal ends the turn as an error; the terminal `result`
+                // handler settles it with ACP's `refusal` stop reason and
+                // streams `lastRefusalExplanation`. The assistant frame's
+                // stop_details is the primary source for that explanation —
+                // this structured banner is the backup source when the frame
+                // carried none (older CLIs, gateways that drop stop_details).
+                //
+                // `refused_user_message_uuid` is explicitly null when the
+                // refused turn was not human-authored (a background
+                // task-notification followup or auto-continuation) — don't
+                // let those pollute the user turn's explanation. `undefined`
+                // (older CLIs that omit the field) can't be attributed either
+                // way, so keep seeding — the same exposure the assistant-frame
+                // capture already has.
+                if (!lastRefusalExplanation && message.refused_user_message_uuid !== null) {
+                  lastRefusalExplanation = message.api_refusal_explanation ?? message.content;
+                }
                 break;
               default:
                 unreachable(message, this.logger);
@@ -1799,6 +1942,24 @@ export class ClaudeAcpAgent {
             // accumulator — promoting after would discard this result's tokens.
             if (!isTaskNotification) {
               ensureActiveTurn();
+            }
+
+            // Every user-turn result terminates a turn (settle, reject, or
+            // orphan skip) and the SDK follows it with a trailing
+            // `session_state_changed: idle` — record the debt so the idle
+            // handler absorbs that idle rather than reading it as a turn the
+            // SDK abandoned (issue #825). One exclusion: the cancelled ACTIVE
+            // turn's own result. It is dropped at the `session.cancelled`
+            // guard, and either the idle itself settles the turn (consuming
+            // the trailer) or the next echo's hand-off does (which records
+            // the debt there instead) — counting here too would double it.
+            // Results skipped while cancelled with NO active turn — orphaned
+            // queued turns the SDK still ran, or a force-cancelled turn's
+            // late result after the backstop settled it — get no such settle,
+            // so their trailers must be counted here or they'd later be read
+            // as the next healthy turn being abandoned and false-fail it.
+            if (!isTaskNotification && (!session.cancelled || !session.activeTurn)) {
+              owedTrailingIdles++;
             }
 
             // Accumulate usage into the user turn's tally. Skip task-notification
@@ -2157,6 +2318,12 @@ export class ClaudeAcpAgent {
                     // would report the cancelled turn as a normal completion.
                     const previous = session.activeTurn;
                     if (session.cancelled) {
+                      // The cancelled turn settles here, but the trailing idle
+                      // its interrupt produces is still in flight — record the
+                      // debt so that lagged idle is absorbed rather than read
+                      // as the freshly-activated turn ending without a result
+                      // (which would false-fail a healthy turn — issue #825).
+                      owedTrailingIdles++;
                       settleTurn(previous, { stopReason: "cancelled" });
                     } else if (
                       previous.pendingCompletion ||
@@ -2204,7 +2371,13 @@ export class ClaudeAcpAgent {
                 lastAssistantError = message.error;
               }
               if (message.message.stop_reason === "refusal") {
-                lastRefusalExplanation = message.message.stop_details?.explanation ?? null;
+                // Keep any explanation already seeded by a
+                // `model_refusal_no_fallback` banner — the banner/frame
+                // ordering is CLI-dependent, and a frame whose stop_details
+                // was dropped (the case the banner backup exists for) must
+                // not clobber the seed back to null.
+                lastRefusalExplanation =
+                  message.message.stop_details?.explanation ?? lastRefusalExplanation;
               }
             }
 
@@ -2401,9 +2574,16 @@ export class ClaudeAcpAgent {
             }
             break;
           }
+          // `conversation_reset` (from `/clear`, plan-mode exit, fresh-session
+          // flows) is safe to drop: turn lifecycle here is driven by
+          // results/idle, and the client owns its own transcript view.
+          // `control_request_progress` only reports on side_question control
+          // requests, which this adapter never issues.
           case "tool_use_summary":
           case "auth_status":
           case "prompt_suggestion":
+          case "conversation_reset":
+          case "control_request_progress":
             break;
           default:
             unreachable(message);
@@ -3113,6 +3293,49 @@ export class ClaudeAcpAgent {
     return { behavior: "allow", updatedInput: outcome.updatedInput };
   }
 
+  /**
+   * Handle `request_user_dialog` control requests — blocking dialogs the CLI
+   * asks the host to render. Only kinds declared in `supportedDialogKinds`
+   * are ever emitted; everything unexpected is answered `cancelled` (the
+   * required answer for unrecognized kinds), which applies the dialog's
+   * default behavior CLI-side. Today the only declared kind is the
+   * refusal-fallback consent prompt, rendered as an ACP form elicitation.
+   */
+  private handleUserDialog(sessionId: string): OnUserDialog {
+    return async (request, { signal }) => {
+      if (request.dialogKind !== REFUSAL_FALLBACK_DIALOG_KIND) {
+        return { behavior: "cancelled" };
+      }
+      const prompt = extractRefusalFallbackPrompt(request.payload);
+      if (!prompt) {
+        this.logger.error(
+          `refusal_fallback_prompt payload had an unexpected shape; cancelling the dialog: ${JSON.stringify(request.payload)}`,
+        );
+        return { behavior: "cancelled" };
+      }
+      let response: CreateElicitationResponse;
+      try {
+        response = await this.client.unstable_createElicitation(
+          refusalFallbackToCreateRequest(prompt, sessionId),
+          signal,
+        );
+      } catch (error) {
+        // A cancellation we requested (signal aborted) is expected teardown;
+        // anything else is a client failure. Either way the safe answer is
+        // `cancelled` — the CLI applies the dialog's default (keep the
+        // refusal) rather than switching models without consent.
+        if (!signal.aborted) {
+          this.logger.error(`Failed to present refusal fallback elicitation: ${error}`);
+        }
+        return { behavior: "cancelled" };
+      }
+      if (signal.aborted) {
+        return { behavior: "cancelled" };
+      }
+      return { behavior: "completed", result: refusalFallbackResultFromResponse(response) };
+    };
+  }
+
   private async sendAvailableCommandsUpdate(sessionId: string): Promise<void> {
     const session = this.sessions[sessionId];
     if (!session) return;
@@ -3177,8 +3400,16 @@ export class ClaudeAcpAgent {
       session.models = { ...session.models, currentModelId: value };
 
       // Recompute availableModes for the new model and clamp the current
-      // mode if the SDK no longer offers it (today: "auto" on Haiku).
-      const newAvailableModes = buildAvailableModes(newModelInfo);
+      // mode if the SDK no longer offers it (today: "auto" on Haiku). An
+      // unknown model (an SDK-initiated refusal fallback to a model outside
+      // the user's `availableModels` allowlist — user-driven switches are
+      // validated against the options first) tells us nothing about its
+      // capabilities, so keep the current modes rather than spuriously
+      // downgrading (e.g. kicking the user out of "auto" for a model that
+      // does support it).
+      const newAvailableModes = newModelInfo
+        ? buildAvailableModes(newModelInfo)
+        : session.modes.availableModes;
       // Capture BEFORE mutating session.modes so the log message reflects
       // the invalidated mode rather than "default".
       const previousModeId = session.modes.currentModeId;
@@ -3273,6 +3504,43 @@ export class ClaudeAcpAgent {
           effortLevel: toSdkEffortLevel(value),
         });
       }
+    }
+  }
+
+  /** Reconcile adapter model state after the SDK persistently swapped the
+   *  session's model out from under us (refusal fallback). The SDK already
+   *  made the switch, so this must NOT call `query.setModel` — it only
+   *  updates our bookkeeping (currentModelId, context window, mode clamping,
+   *  effort/Fast-mode options) via the same `applyConfigOptionValue` path a
+   *  user-driven model change takes, then notifies the client. */
+  private async syncModelAfterRefusalFallback(
+    sessionId: string,
+    session: Session,
+    fallbackModel: string,
+  ): Promise<void> {
+    // Map the SDK-reported model onto one of the session's model options
+    // (handles display names and `resolvedModel` ids). The fallback model may
+    // not be among the options — e.g. excluded by the user's
+    // `availableModels` allowlist — in which case we track the raw id: the
+    // picker shows no selection, but the model-dependent bookkeeping and any
+    // later `setModel` round-trip stay truthful to what the SDK is running.
+    const resolved = resolveModelPreference(session.modelInfos, fallbackModel);
+    const value = resolved?.value ?? fallbackModel;
+    if (session.models.currentModelId === value) return;
+
+    try {
+      await this.updateConfigOption(sessionId, MODEL_CONFIG_ID, value);
+    } catch (err) {
+      // This runs on the consumer loop: a throw here tears down the query
+      // stream (failAllTurns + closeQueryStream) and bricks the session —
+      // far worse than stale bookkeeping. The user-driven RPC path lets the
+      // same errors propagate to fail just that request; here we log and
+      // move on, matching the setPermissionMode containment inside
+      // applyConfigOptionValue.
+      this.logger.error(
+        `Failed to reconcile model state after refusal fallback to "${fallbackModel}":`,
+        err,
+      );
     }
   }
 
@@ -3575,6 +3843,18 @@ export class ClaudeAcpAgent {
       // canUseTool, not here.)
       ...(elicitationSupport.form || elicitationSupport.url
         ? { onElicitation: this.handleMcpElicitation(sessionId, elicitationSupport) }
+        : {}),
+      // Render the CLI's refusal-fallback consent prompt ("<model> declined —
+      // retry with <fallback>?") as an ACP form elicitation. Declaring the
+      // kind is the opt-in: the CLI never emits an undeclared dialog, and the
+      // flow instead degrades to the classic refusal error ending the turn.
+      // Gated on form elicitation since that's the only ACP surface that can
+      // present a choice outside a tool call.
+      ...(elicitationSupport.form
+        ? {
+            onUserDialog: this.handleUserDialog(sessionId),
+            supportedDialogKinds: [REFUSAL_FALLBACK_DIALOG_KIND],
+          }
         : {}),
       pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE ?? (await claudeCliPath()),
       extraArgs: {
@@ -3891,19 +4171,24 @@ function totalTokens(usage: UsageSnapshot): number {
   );
 }
 
+/** Error kinds this adapter invents itself, alongside the SDK's categorical
+ *  `SDKAssistantMessageError` kinds: `no_result` marks a turn the SDK declared
+ *  over without ever emitting its result (issue #825). */
+type AgentErrorKind = SDKAssistantMessageError | "no_result";
+
 /**
  * Build the `data` payload attached to a `RequestError.internalError` when we
- * have a categorical error from the Claude SDK. Returns `undefined` when no
- * categorical error is available, matching the previous behavior of passing
- * `undefined` to `RequestError.internalError`.
+ * have a categorical error — from the Claude SDK, or one of the adapter's own
+ * kinds. Returns `undefined` when no categorical error is available, matching
+ * the previous behavior of passing `undefined` to `RequestError.internalError`.
  *
  * The `errorKind` field is a convention for ACP clients to dispatch on
  * without having to pattern-match the human-readable message text. Clients
  * that don't understand it fall back to the existing message-based rendering.
  */
 function errorKindData(
-  errorKind: SDKAssistantMessageError | undefined,
-): { errorKind: SDKAssistantMessageError } | undefined {
+  errorKind: AgentErrorKind | undefined,
+): { errorKind: AgentErrorKind } | undefined {
   return errorKind ? { errorKind } : undefined;
 }
 
@@ -3972,8 +4257,10 @@ function buildAvailableModes(modelInfo: ModelInfo | undefined): SessionModeState
 
   modes.push(
     {
+      // Claude Code 2.1.200 renamed this mode to "Manual" across its surfaces;
+      // the wire id stays "default" ("manual" is only an accepted input alias).
       id: "default",
-      name: "Default",
+      name: "Manual",
       description: "Standard behavior, prompts for dangerous operations",
     },
     {
@@ -4777,6 +5064,9 @@ export function toAcpNotifications(
   const registerHooks = options?.registerHooks !== false;
   const supportsTerminalOutput = options?.clientCapabilities?._meta?.["terminal_output"] === true;
   if (typeof content === "string") {
+    if (content.length === 0) {
+      return [];
+    }
     const update: SessionNotification["update"] = {
       sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
       content: {
@@ -4806,13 +5096,15 @@ export function toAcpNotifications(
     switch (chunk.type) {
       case "text":
       case "text_delta":
-        update = {
-          sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
-          content: {
-            type: "text",
-            text: chunk.text,
-          },
-        };
+        if (chunk.text.length > 0) {
+          update = {
+            sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
+            content: {
+              type: "text",
+              text: chunk.text,
+            },
+          };
+        }
         break;
       case "image":
         update = {
