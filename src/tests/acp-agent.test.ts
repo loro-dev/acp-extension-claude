@@ -38,6 +38,7 @@ import {
   messageIdForGrouping,
   buildConfigOptions,
   createFastModeConfigOption,
+  CLAUDE_PROMPT_ACTIVATED_METHOD,
   discoverCustomAgents,
   runPromptWithCancellation,
   type AcpClient,
@@ -3281,6 +3282,12 @@ describe("logout", () => {
       clientCapabilities: {},
     });
     expect(response.agentCapabilities?.auth?.logout).toEqual({});
+    const claudeCodeCapabilities = response.agentCapabilities?._meta?.claudeCode as
+      Record<string, unknown> | undefined;
+    expect(claudeCodeCapabilities?.promptQueueing).toEqual({
+      version: 1,
+      activationNotification: CLAUDE_PROMPT_ACTIVATED_METHOD,
+    });
   });
 });
 
@@ -5900,6 +5907,80 @@ describe("post-error recovery", () => {
 
     await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
     await expect(second).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+  });
+
+  it("holds post-handoff output behind the prompt activation notification", async () => {
+    const events: string[] = [];
+    let releaseSecondActivation!: () => void;
+    const secondActivationReleased = new Promise<void>((resolve) => {
+      releaseSecondActivation = resolve;
+    });
+    const mockClient = {
+      sessionUpdate: vi.fn(async (notification: SessionNotification) => {
+        if (notification.update.sessionUpdate === "agent_message_chunk") {
+          const content = notification.update.content;
+          events.push(`output:${content.type === "text" ? content.text : content.type}`);
+        }
+      }),
+      extNotification: vi.fn(async (method: string, params: Record<string, unknown>) => {
+        if (method !== CLAUDE_PROMPT_ACTIVATED_METHOD) return;
+        const promptId = String(params.promptId);
+        events.push(`activated:${promptId}`);
+        if (promptId === "prompt-b") {
+          await secondActivationReleased;
+        }
+      }),
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const first = await iter.next();
+        yield userEcho(first.value);
+        const second = await iter.next();
+        yield {
+          type: "system",
+          subtype: "local_command_output",
+          content: "before",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield userEcho(second.value);
+        yield {
+          type: "system",
+          subtype: "local_command_output",
+          content: "after",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+      _meta: { claudeCode: { promptId: "prompt-a" } },
+    });
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "second" }],
+      _meta: { claudeCode: { promptId: "prompt-b" } },
+    });
+
+    await vi.waitFor(() => expect(events).toContain("activated:prompt-b"));
+    expect(events).toEqual(["activated:prompt-a", "output:before", "activated:prompt-b"]);
+    releaseSecondActivation();
+    await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    await expect(second).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    expect(events).toEqual([
+      "activated:prompt-a",
+      "output:before",
+      "activated:prompt-b",
+      "output:after",
+    ]);
   });
 
   it("does not let a settled turn's lagging idle resolve the next turn early (issue #773 race)", async () => {

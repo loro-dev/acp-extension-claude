@@ -18,6 +18,16 @@ This tool implements an ACP agent by using the official [Claude Agent SDK](https
 
 Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
 
+## Acknowledged prompt queueing
+
+The adapter advertises a versioned `agentCapabilities._meta.claudeCode.promptQueueing`
+extension. A client that uses it must attach a unique
+`_meta.claudeCode.promptId` to `session/prompt`. When the Claude SDK echoes and
+activates that queued prompt, the adapter sends
+`_claude/promptActivated { sessionId, promptId }` before forwarding any output
+owned by the new prompt. Clients can hold the notification handler while they
+atomically switch their local turn/output ownership.
+
 ## Contribution Policy
 
 This project does not require a Contributor License Agreement (CLA). Instead, contributions are accepted under the following terms:
