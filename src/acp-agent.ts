@@ -171,7 +171,7 @@ const ZERO_USAGE = Object.freeze({
 
 const DEFAULT_CONTEXT_WINDOW = 200000;
 const CLAUDE_TASK_LIFECYCLE_METHOD = "_claude/taskLifecycle";
-export const CLAUDE_PROMPT_ACTIVATED_METHOD = "_claude/promptActivated";
+export const CLAUDE_STEER_APPLIED_METHOD = "_claude/steerApplied";
 
 /** Floor after `session/cancel` before the adapter forces the active prompt
  *  loop to return "cancelled". `query.interrupt()` normally makes the SDK
@@ -211,8 +211,8 @@ type Turn = {
    *  consumer can match the replayed user message to this turn. */
   promptUuid: string;
   /** Client-generated correlation id echoed only when the SDK actually
-   *  activates this queued prompt. */
-  clientPromptId?: string;
+   *  applies this steer to the main-agent command queue. */
+  clientSteerId?: string;
   /** Local-only slash commands (e.g. `/clear`) return a result without an echo,
    *  so the consumer can't promote them via the replay; it falls back to
    *  promoting the queue head when the result arrives. */
@@ -237,13 +237,17 @@ type Turn = {
   reject: (error: unknown) => void;
 };
 
-function getClientPromptId(meta: PromptRequest["_meta"]): string | undefined {
+function getClientSteerId(meta: PromptRequest["_meta"]): string | undefined {
   const claudeCode = meta?.claudeCode;
   if (typeof claudeCode !== "object" || claudeCode === null) {
     return undefined;
   }
-  const promptId = (claudeCode as Record<string, unknown>).promptId;
-  return typeof promptId === "string" && promptId.length > 0 ? promptId : undefined;
+  const steer = (claudeCode as Record<string, unknown>).steer;
+  if (typeof steer !== "object" || steer === null) {
+    return undefined;
+  }
+  const steerId = (steer as Record<string, unknown>).id;
+  return typeof steerId === "string" && steerId.length > 0 ? steerId : undefined;
 }
 
 type Session = {
@@ -913,9 +917,9 @@ export class ClaudeAcpAgent {
       agentCapabilities: {
         _meta: {
           claudeCode: {
-            promptQueueing: {
+            steer: {
               version: 1,
-              activationNotification: CLAUDE_PROMPT_ACTIVATED_METHOD,
+              appliedNotification: CLAUDE_STEER_APPLIED_METHOD,
             },
           },
         },
@@ -1104,6 +1108,12 @@ export class ClaudeAcpAgent {
     }
 
     const userMessage = promptToClaude(params);
+    const clientSteerId = getClientSteerId(params._meta);
+    if (clientSteerId) {
+      // `now` is Claude Code's steering lane: it wakes the main loop while
+      // background agents keep running. Ordinary prompts retain default `next`.
+      userMessage.priority = "now";
+    }
     const promptUuid = randomUUID();
     userMessage.uuid = promptUuid;
 
@@ -1119,7 +1129,7 @@ export class ClaudeAcpAgent {
     // consumer is running, and awaits the deferred.
     const turn: Turn = {
       promptUuid,
-      clientPromptId: getClientPromptId(params._meta),
+      clientSteerId,
       isLocalOnlyCommand,
       settled: false,
       pendingTaskIds: new Set(),
@@ -1255,10 +1265,10 @@ export class ClaudeAcpAgent {
       session.cancelled = false;
       session.pendingOrphanResults = 0;
       resetTurnScratch();
-      if (turn.clientPromptId) {
-        await this.client.extNotification(CLAUDE_PROMPT_ACTIVATED_METHOD, {
+      if (turn.clientSteerId) {
+        await this.client.extNotification(CLAUDE_STEER_APPLIED_METHOD, {
           sessionId: params.sessionId,
-          promptId: turn.clientPromptId,
+          steerId: turn.clientSteerId,
         });
       }
     };

@@ -1,7 +1,7 @@
 // Export the main agent class and utilities for library usage
 export {
   ClaudeAcpAgent,
-  CLAUDE_PROMPT_ACTIVATED_METHOD,
+  CLAUDE_STEER_APPLIED_METHOD,
   isLocalCommandMetadata,
   stripLocalCommandMetadata,
   runAcp,
