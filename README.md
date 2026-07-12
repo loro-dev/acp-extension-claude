@@ -18,6 +18,18 @@ This tool implements an ACP agent by using the official [Claude Agent SDK](https
 
 Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
 
+## Acknowledged steering
+
+The adapter advertises a versioned `agentCapabilities._meta.claudeCode.steer`
+extension. A client that uses it must attach a unique
+`_meta.claudeCode.steer.id` to `session/prompt`. The adapter maps only these
+requests to Claude's `SDKUserMessage.priority = "now"`; ordinary prompts keep
+the SDK's default `next` behavior. When the Claude SDK echoes and applies the
+steer to the main-agent loop, the adapter sends
+`_claude/steerApplied { sessionId, steerId }` before forwarding output owned by
+the new prompt. Clients can hold the notification handler while they atomically
+switch their local turn/output ownership.
+
 ## Contribution Policy
 
 This project does not require a Contributor License Agreement (CLA). Instead, contributions are accepted under the following terms:

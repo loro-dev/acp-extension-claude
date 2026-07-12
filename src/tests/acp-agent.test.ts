@@ -38,6 +38,7 @@ import {
   messageIdForGrouping,
   buildConfigOptions,
   createFastModeConfigOption,
+  CLAUDE_STEER_APPLIED_METHOD,
   discoverCustomAgents,
   runPromptWithCancellation,
   type AcpClient,
@@ -3281,6 +3282,12 @@ describe("logout", () => {
       clientCapabilities: {},
     });
     expect(response.agentCapabilities?.auth?.logout).toEqual({});
+    const claudeCodeCapabilities = response.agentCapabilities?._meta?.claudeCode as
+      Record<string, unknown> | undefined;
+    expect(claudeCodeCapabilities?.steer).toEqual({
+      version: 1,
+      appliedNotification: CLAUDE_STEER_APPLIED_METHOD,
+    });
   });
 });
 
@@ -5900,6 +5907,97 @@ describe("post-error recovery", () => {
 
     await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
     await expect(second).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+  });
+
+  it("applies a now-priority steer while the previous turn has a background task", async () => {
+    const events: string[] = [];
+    const submittedMessages: any[] = [];
+    let releaseSteerApplication!: () => void;
+    const steerApplicationReleased = new Promise<void>((resolve) => {
+      releaseSteerApplication = resolve;
+    });
+    const mockClient = {
+      sessionUpdate: vi.fn(async (notification: SessionNotification) => {
+        if (notification.update.sessionUpdate === "agent_message_chunk") {
+          const content = notification.update.content;
+          events.push(`output:${content.type === "text" ? content.text : content.type}`);
+        }
+      }),
+      extNotification: vi.fn(async (method: string, params: Record<string, unknown>) => {
+        if (method !== CLAUDE_STEER_APPLIED_METHOD) return;
+        const steerId = String(params.steerId);
+        events.push(`applied:${steerId}`);
+        if (steerId === "steer-b") {
+          await steerApplicationReleased;
+        }
+      }),
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const first = await iter.next();
+        submittedMessages.push(first.value);
+        yield userEcho(first.value);
+        yield {
+          type: "system",
+          subtype: "task_started",
+          task_id: "task-1",
+          description: "Background review",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        const second = await iter.next();
+        submittedMessages.push(second.value);
+        yield {
+          type: "system",
+          subtype: "local_command_output",
+          content: "before",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield userEcho(second.value);
+        yield {
+          type: "system",
+          subtype: "local_command_output",
+          content: "after",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+        yield {
+          type: "system",
+          subtype: "task_notification",
+          task_id: "task-1",
+          status: "completed",
+          output_file: "/tmp/task-1.txt",
+          summary: "done",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "second" }],
+      _meta: { claudeCode: { steer: { id: "steer-b" } } },
+    });
+
+    await vi.waitFor(() => expect(events).toContain("applied:steer-b"));
+    expect(submittedMessages[0]?.priority).toBeUndefined();
+    expect(submittedMessages[1]?.priority).toBe("now");
+    expect(events).toEqual(["output:before", "applied:steer-b"]);
+    releaseSteerApplication();
+    await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    await expect(second).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    expect(events).toEqual(["output:before", "applied:steer-b", "output:after"]);
   });
 
   it("does not let a settled turn's lagging idle resolve the next turn early (issue #773 race)", async () => {

@@ -171,6 +171,7 @@ const ZERO_USAGE = Object.freeze({
 
 const DEFAULT_CONTEXT_WINDOW = 200000;
 const CLAUDE_TASK_LIFECYCLE_METHOD = "_claude/taskLifecycle";
+export const CLAUDE_STEER_APPLIED_METHOD = "_claude/steerApplied";
 
 /** Floor after `session/cancel` before the adapter forces the active prompt
  *  loop to return "cancelled". `query.interrupt()` normally makes the SDK
@@ -209,6 +210,9 @@ type Turn = {
   /** uuid stamped on the pushed `SDKUserMessage`; the SDK echoes it back so the
    *  consumer can match the replayed user message to this turn. */
   promptUuid: string;
+  /** Client-generated correlation id echoed only when the SDK actually
+   *  applies this steer to the main-agent command queue. */
+  clientSteerId?: string;
   /** Local-only slash commands (e.g. `/clear`) return a result without an echo,
    *  so the consumer can't promote them via the replay; it falls back to
    *  promoting the queue head when the result arrives. */
@@ -232,6 +236,19 @@ type Turn = {
   resolve: (response: PromptResponse) => void;
   reject: (error: unknown) => void;
 };
+
+function getClientSteerId(meta: PromptRequest["_meta"]): string | undefined {
+  const claudeCode = meta?.claudeCode;
+  if (typeof claudeCode !== "object" || claudeCode === null) {
+    return undefined;
+  }
+  const steer = (claudeCode as Record<string, unknown>).steer;
+  if (typeof steer !== "object" || steer === null) {
+    return undefined;
+  }
+  const steerId = (steer as Record<string, unknown>).id;
+  return typeof steerId === "string" && steerId.length > 0 ? steerId : undefined;
+}
 
 type Session = {
   query: Query;
@@ -900,7 +917,10 @@ export class ClaudeAcpAgent {
       agentCapabilities: {
         _meta: {
           claudeCode: {
-            promptQueueing: true,
+            steer: {
+              version: 1,
+              appliedNotification: CLAUDE_STEER_APPLIED_METHOD,
+            },
           },
         },
         promptCapabilities: {
@@ -1088,6 +1108,12 @@ export class ClaudeAcpAgent {
     }
 
     const userMessage = promptToClaude(params);
+    const clientSteerId = getClientSteerId(params._meta);
+    if (clientSteerId) {
+      // `now` is Claude Code's steering lane: it wakes the main loop while
+      // background agents keep running. Ordinary prompts retain default `next`.
+      userMessage.priority = "now";
+    }
     const promptUuid = randomUUID();
     userMessage.uuid = promptUuid;
 
@@ -1103,6 +1129,7 @@ export class ClaudeAcpAgent {
     // consumer is running, and awaits the deferred.
     const turn: Turn = {
       promptUuid,
+      clientSteerId,
       isLocalOnlyCommand,
       settled: false,
       pendingTaskIds: new Set(),
@@ -1233,11 +1260,17 @@ export class ClaudeAcpAgent {
      *  activates, so a non-zero remainder means the SDK dropped a queued turn on
      *  interrupt (no orphan emitted) — drop the stale count so a later echo-less
      *  result isn't wrongly skipped. */
-    const activateTurn = (turn: Turn) => {
+    const activateTurn = async (turn: Turn) => {
       session.activeTurn = turn;
       session.cancelled = false;
       session.pendingOrphanResults = 0;
       resetTurnScratch();
+      if (turn.clientSteerId) {
+        await this.client.extNotification(CLAUDE_STEER_APPLIED_METHOD, {
+          sessionId: params.sessionId,
+          steerId: turn.clientSteerId,
+        });
+      }
     };
 
     /** Ensure there is an active turn before a user-turn result that carries no
@@ -1255,7 +1288,7 @@ export class ClaudeAcpAgent {
      *  prompt. `session.pendingOrphanResults` counts exactly how many such
      *  orphans are still expected (FIFO, they arrive before any live turn's
      *  result), so we skip those and only promote once the count is drained. */
-    const ensureActiveTurn = () => {
+    const ensureActiveTurn = async () => {
       if (session.activeTurn) {
         return;
       }
@@ -1267,7 +1300,7 @@ export class ClaudeAcpAgent {
         session.pendingOrphanResults!--;
         return;
       }
-      activateTurn(head);
+      await activateTurn(head);
     };
 
     const clearTurnTaskTracking = (turn: Turn) => {
@@ -1941,7 +1974,7 @@ export class ClaudeAcpAgent {
             // Promote BEFORE accumulating usage, since activation resets the
             // accumulator — promoting after would discard this result's tokens.
             if (!isTaskNotification) {
-              ensureActiveTurn();
+              await ensureActiveTurn();
             }
 
             // Every user-turn result terminates a turn (settle, reject, or
@@ -2343,7 +2376,7 @@ export class ClaudeAcpAgent {
                       });
                     }
                   }
-                  activateTurn(queued);
+                  await activateTurn(queued);
                 }
                 break;
               }
