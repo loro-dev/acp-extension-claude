@@ -9,15 +9,10 @@ import {
   CompleteElicitationNotification,
   CreateElicitationRequest,
   CreateElicitationResponse,
-  DisableProviderRequest,
-  DisableProviderResponse,
   ForkSessionRequest,
   ForkSessionResponse,
   InitializeRequest,
   InitializeResponse,
-  ListProvidersRequest,
-  ListProvidersResponse,
-  LlmProtocol,
   ListSessionsRequest,
   ListSessionsResponse,
   LoadSessionRequest,
@@ -30,12 +25,9 @@ import {
   PermissionOption,
   PromptRequest,
   PromptResponse,
-  ProviderInfo,
   ReadTextFileRequest,
   ReadTextFileResponse,
   RequestError,
-  SetProviderRequest,
-  SetProviderResponse,
   RequestPermissionRequest,
   RequestPermissionResponse,
   ResumeSessionRequest,
@@ -228,77 +220,19 @@ type Turn = {
   /** Set once the deferred has been resolved/rejected, so the consumer never
    *  settles a turn twice (idle + handoff + stream-end can all race). */
   settled: boolean;
-  /** Set when a `command_lifecycle` "started" frame arrives for this turn's
-   *  uuid (msg_lifecycle_v1 CLIs): the SDK dispatched the command into a turn.
-   *  Read by cancel() to seed the orphan's state — a started orphan's turn may
-   *  still emit a result, an undispatched one may be dropped without one. */
-  commandStarted?: boolean;
-  /** Set when a terminal `command_lifecycle` frame arrives for this turn's
-   *  uuid while the turn is still queued (msg_lifecycle_v1 CLIs). The command
-   *  is already finished SDK-side, so a later cancel() must not seed an
-   *  orphan entry for it — no terminal frame will ever come to drain it.
-   *  "completed"/"discarded" leave nothing outstanding; "cancelled" after a
-   *  dispatch means the dead turn's result may still arrive (seeded as a
-   *  zombie) unless it already passed (`commandResultSeen`), and without a
-   *  dispatch means dropped (nothing coming). */
-  commandFinished?: "completed" | "discarded" | "cancelled";
-  /** Set when a user-turn result arrives while this command is known
-   *  dispatched (`commandStarted`) with no terminal frame yet. Turns run
-   *  sequentially and frames arrive in stream order, so the turn this command
-   *  was dispatched into IS the turn that emitted that result — including
-   *  when the command was FOLDED into another turn (their shared result).
-   *  Read by cancel() and the force-cancel wedge path so neither seeds an
-   *  orphan entry for a result that has already passed: such an entry could
-   *  never be drained by its result and would swallow an unrelated later
-   *  echo-less one instead. */
-  commandResultSeen?: boolean;
-  /** Task ids of the background subagents launched while this turn was the
-   *  active one — including during its held-open drain window, so an agent
-   *  chain (a followup that launches another subagent) extends the hold.
-   *  A turn only waits on its OWN spawned subagents: a long-running agent
-   *  from an earlier turn must not stall every later prompt's settlement.
-   *  Known residual: task_started carries no lineage, so a spawn made by a
-   *  PREVIOUS turn's followup chain while a later turn happens to be held
-   *  is attributed to the holder — extending that hold behind a foreign
-   *  chain. Bounded: the hold still ends at drain, hand-off, or cancel. */
-  spawnedTaskIds?: Set<string>;
-  /** Set instead of settling when the turn's terminal result arrives while
-   *  subagents it spawned are still live (`spawnedTaskIds` ∩
-   *  `session.liveBackgroundTasks`). The turn is held open — its
-   *  `session/prompt` stays pending — so the subagents' streamed output,
-   *  their permission requests (which would otherwise block on an RPC a
-   *  client that stops consuming at the prompt response never answers —
-   *  issue #866), and the model's task-notification followup summary all
-   *  land inside the turn.
-   *
-   *  The CLI does NOT hold its trailing idle for background agents (observed
-   *  on 2.1.206: `idle` follows the result immediately while the subagent
-   *  still runs), so the hold spans multiple idle cycles: user result →
-   *  idle → (subagent works) → task_notification → followup turn → idle.
-   *  The stored outcome (the result's stop reason and usage snapshot) is
-   *  what the turn settles with once its spawned subagents have settled —
-   *  at the followup's terminal result (the summary has streamed by then),
-   *  or at an idle with none of its subagents left (no followup came). A
-   *  cancel or the next turn's echo hand-off settles it earlier, so a
-   *  long-running subagent never holds the prompt hostage.
-   *
-   *  Accepted residuals. (1) A subagent that ends WITHOUT waking the model —
-   *  its task_notification lost or skipped (only the terminal task_updated
-   *  patch is guaranteed per transition) — leaves no followup result and no
-   *  further idle, so the held turn parks until `session/cancel` or the next
-   *  prompt (either settles it: the echo hand-off or ensureActiveTurn's
-   *  held-turn hand-off). Settling at the prune sites instead would preempt
-   *  the followup summary in the normal ordering (prunes precede the
-   *  notification), and a grace timer was judged not worth the machinery —
-   *  the same rescue contract as the adapter's other wedge classes (issue
-   *  #825's out-of-scope notes). (2) Drained-ness is judged by live-task
-   *  membership only: with parallel subagents, a notification that prunes
-   *  the last task during an earlier task's still-streaming followup lets
-   *  that followup's result settle the turn before the LAST task's summary
-   *  streams — degrading to post-turn delivery for it, never worse than the
-   *  pre-hold behavior (pending wakes are not countable: notifications can
-   *  batch into one followup). */
-  deferredSettle?: PromptResponse;
+  /** Background SDK tasks that were started while this turn was active and
+   *  have not yet emitted a terminal lifecycle event. */
+  pendingTaskIds: Set<string>;
+  /** Whether this turn started any visible background SDK task. Even if the
+   *  task reaches a terminal state before the top-level result, the turn should
+   *  still wait for the following idle drain marker. */
+  startedBackgroundTask: boolean;
+  /** Terminal prompt response captured at the top-level result while the turn
+   *  is still waiting for its background tasks / follow-up drain to finish. */
+  pendingCompletion?: PromptResponse;
+  /** True after a turn has reached its top-level result with tasks still
+   *  running. Once the tasks finish, the next SDK idle is the safe drain point. */
+  waitForBackgroundIdle: boolean;
   resolve: (response: PromptResponse) => void;
   reject: (error: unknown) => void;
 };
@@ -332,44 +266,12 @@ type Session = {
    *  the SDK still runs it and emits a result with no uuid we can match. Because
    *  the SDK processes input FIFO, those orphan results arrive (in submission
    *  order) before the next live turn's, so skipping exactly this many leaves
-   *  the genuine head untouched. On CLIs with the interrupt receipt, orphans
-   *  the interrupt dropped (absent from `still_queued`) are uncounted as soon
-   *  as the receipt arrives (see cancel()). Reset to 0 on every activation as
-   *  a backstop against a dropped queued input this can't see (older CLIs, a
-   *  receipt lost to a failed control round-trip). Only used when the CLI does
-   *  NOT emit lifecycle frames (see `orphanCommands` for the msg_lifecycle_v1
-   *  lane); a count can't express command coalescing — N queued commands can
-   *  fold into ONE turn emitting one result, leaving a stale skip of N-1. */
+   *  the genuine head untouched. Reset to 0 on every activation as a backstop
+   *  against an SDK that drops queued input on interrupt (no orphan emitted). */
   pendingOrphanResults?: number;
-  /** msg_lifecycle_v1 lane of the orphan accounting (see
-   *  `pendingOrphanResults` for the count lane): the uuids of cancelled queued
-   *  turns whose SDK-side command may still produce an unaccounted result,
-   *  keyed to what we know of its fate. "pending" = not seen dispatched; if
-   *  the SDK drops it (interrupt, `cancelled` before "started") no result
-   *  ever comes. "started" = dispatched into a turn whose result is still
-   *  coming; exactly one terminal lifecycle frame will follow. "zombie" = its
-   *  turn was aborted/failed after dispatch with no result seen since
-   *  (`cancelled` after "started"); no more lifecycle frames come, but the
-   *  dead turn's error result may still arrive. Entries are removed the
-   *  moment their result is covered: EVERY user-turn result covers ALL
-   *  started and zombie entries at once (turns run sequentially and frames
-   *  arrive in stream order, so at any result the started entries were
-   *  dispatched into — possibly folded into — the emitting turn, and any
-   *  zombie's late result has already passed or never existed), whether that
-   *  result was attributed to the active turn or skipped echo-less (see
-   *  recordResultForOrphanCommands / ensureActiveTurn). A command's own
-   *  terminal frame also drains its entry ("completed" is emitted after any
-   *  result its turn produced; a bare `cancelled` deletes a pending entry —
-   *  dropped without running — and zombifies a started one). An echo-less
-   *  result is an orphan's iff this map is non-empty (FIFO: orphan turns run
-   *  before any live turn's). Cleared on every activation, same self-heal as
-   *  the count (covers a lost frame, which can leak an entry — each state
-   *  bounds the damage to one wrong skip). */
-  orphanCommands?: Map<string, "pending" | "started" | "zombie">;
-  /** True once a `system`/init advertised the msg_lifecycle_v1 capability, so
-   *  cancel() routes orphan accounting to `orphanCommands` (exact, per-uuid)
-   *  instead of `pendingOrphanResults` (count, coalescing-blind). */
-  msgLifecycleV1?: boolean;
+  /** Owner turn for SDK background task IDs. Lets task lifecycle events settle
+   *  the prompt that spawned them even if a later prompt is already active. */
+  taskOwners?: Map<string, Turn>;
   /** The long-lived consumer task. Lazily started on the first `prompt()` and
    *  kept alive for the session so between-turn/background messages are still
    *  drained and forwarded. */
@@ -415,12 +317,11 @@ type Session = {
    *  cancel. */
   forceCancelTimer?: ReturnType<typeof setTimeout>;
   emitRawSDKMessages: boolean | SDKMessageFilter[];
-  /** Context window size of the session's current model, carried across
+  /** Context window size of the last top-level assistant model, carried across
    *  prompts so mid-stream usage_update notifications report a correct `size`
-   *  before the turn's first result message arrives. Seeded from the SDK's
-   *  getContextUsage report at session creation (DEFAULT_CONTEXT_WINDOW when
-   *  that and the text heuristic both fail), refreshed the same way on model
-   *  switches, and confirmed by each result's modelUsage. */
+   *  before the turn's first result message arrives. Defaults to
+   *  DEFAULT_CONTEXT_WINDOW, refreshed from each result's modelUsage, and
+   *  invalidated when the user switches the session's model. */
   contextWindowSize: number;
   /** Accumulated task list for the session, keyed by task ID. Task IDs are
    *  per-session, so this state must not be shared across sessions. */
@@ -445,116 +346,6 @@ type Session = {
    *  tool_use block streams; this set makes the two paths converge regardless of
    *  order. Pruned at `tool_result` time alongside `toolUseCache`. */
   emittedToolCalls: Set<string>;
-  /** Registry of live background tasks, keyed by task id: populated at
-   *  `task_started`, pruned when the task settles (a `task_notification` or
-   *  a terminal `task_updated` patch), and reconciled against
-   *  `background_tasks_changed`'s replace-semantics payload so a lost
-   *  bookend can't leak an entry. One structure for both of its concerns so
-   *  a future terminal path can't prune one and not the other:
-   *
-   *  `parentToolUseId` — the tool_use id of the Agent/Task call that spawned
-   *  the task. For subagent tasks the SDK keys its registry by agent id, so
-   *  `task_started.task_id` IS the `agentID` that `canUseTool` later
-   *  receives. Lets the permission flow attribute a subagent's
-   *  eagerly-emitted `tool_call` (and the permission request itself) to its
-   *  parent tool call via `_meta.claudeCode.parentToolUseId`, matching the
-   *  streamed subagent path. Best-effort: a `canUseTool` that races ahead of
-   *  the consumer processing `task_started` omits the attribution from the
-   *  eager tool_call, and the streamed tool_use chunk's refining
-   *  `tool_call_update` — which carries the message-level
-   *  `parent_tool_use_id` — restores it for merging clients; that recovery
-   *  is what makes best-effort acceptable here.
-   *
-   *  `isSubagent` — whether the task is a Task/Agent-tool subagent
-   *  (`task_started` carried a `subagent_type`). Read by
-   *  `turnAwaitingSubagents` (with `spawnedTaskIds`) to decide whether a
-   *  turn's settlement is deferred (see `Turn.deferredSettle`), so the
-   *  subagents' post-result output and permission requests stay inside the
-   *  turn (issues #864/#866). Deliberately false for non-subagent background
-   *  tasks (e.g. a `run_in_background` dev server): those can outlive every
-   *  turn, and the model's contract with them is a wake-on-exit
-   *  notification, not a turn-scoped drain — a hold must NEVER wait on a
-   *  shell.
-   *
-   *  `endedPerLevel` — a `background_tasks_changed` payload did not include
-   *  this subagent entry. The level's universe is BACKGROUND tasks only, so
-   *  a live sync (foreground) subagent is legitimately absent — its entry is
-   *  kept for permission attribution — but a hold must stop waiting on the
-   *  id: an absent id can equally be a leaked async entry whose settle
-   *  bookends were lost, and waiting on it would park the hold forever.
-   *  Non-subagent entries are simply deleted instead (shells are always in
-   *  the level's universe). */
-  liveBackgroundTasks: Map<
-    string,
-    {
-      parentToolUseId?: string;
-      isSubagent: boolean;
-      /** Absent-from-level lifecycle, one field so the illegal
-       *  armed-but-not-ended state is unrepresentable: undefined = live per
-       *  the level signal; "ended" = a level omitted the task (holds stop
-       *  waiting on it; attribution is kept); "sweep-armed" = a turn
-       *  activation saw it ended — the NEXT activation deletes it. The
-       *  one-activation grace exists for the absent-mark race (a level
-       *  payload built before a live async agent's registration): a
-       *  corrective inclusive level resets the field to undefined — one
-       *  assignment, disarming any in-flight sweep — if it arrives within a
-       *  full turn, keeping the agent's attribution; eager deletion would
-       *  be irreversible, since levels never ADD entries. A re-mark
-       *  preserves an in-flight arm (`??=`), keeping a continuously absent
-       *  entry on its two-activation clock. */
-      endedPerLevel?: "ended" | "sweep-armed";
-    }
-  >;
-  /** Whether any top-level assistant text reached the client since the last
-   *  stretch boundary. Set as a side effect of sending in the consumer's
-   *  `sendUpdate`, never at an emission site; read at the terminal `result`
-   *  to tell a turn whose answer was already delivered from one that only
-   *  ever carried it on `result` (issue #453). Session-level (not
-   *  consumer-scoped) so cancel()'s inline settle can clear it.
-   *
-   *  The CURRENT boundary set — a new clear site must be added here: the
-   *  result case's `finally` (user-turn results), settleActive's wasHeld
-   *  clear (every held-turn settle lane: drain settle, both hand-offs,
-   *  stream-done), failActive, the force-cancel backstop, the idle
-   *  cancelled-settle, the autonomous-result close (only with no turn
-   *  active OR queued — see its queued-turn guard), and cancel()'s inline
-   *  mirror.
-   *
-   *  Deliberately NOT reset on turn activation: activation can fire
-   *  mid-message (see the echo hand-off), so a flag cleared there would
-   *  forget text that already streamed and the result text would be emitted
-   *  a second time. Neither the consolidated `assistant` message nor a
-   *  `stream_event` carries `origin`, so an autonomous cycle's prose is
-   *  indistinguishable from a user turn's here and sets the flag too; the
-   *  autonomous-result close normally ends that stretch so a replayed
-   *  prompt behind it still delivers, and only in the racing window (a
-   *  turn already active or queued when the autonomous result lands) does
-   *  the replayed turn stay silent rather than risk a duplicate. */
-  emittedAssistantText: boolean;
-  /** The most recent `session_state_changed` state the consumer processed.
-   *  Read by cancel() to decide whether the interrupt will produce a
-   *  trailing idle worth pre-counting: interrupting a RUNNING cycle yields
-   *  one; interrupting an already-idle session (the common held-turn shape)
-   *  yields none, and a pre-counted debt that never drains would mask one
-   *  future issue-#825 detection. */
-  lastSessionState?: "idle" | "running" | "requires_action";
-  /** How many trailing `session_state_changed: idle` messages are already
-   *  accounted for: every result is followed by one (user-turn results that
-   *  terminate a turn — settle, reject, or orphan skip — and autonomous
-   *  cycles alike), as is a cancelled turn settled by the next turn's echo
-   *  hand-off or by cancel()'s inline settle of a held turn whose interrupt
-   *  pre-empts a running cycle — the reason this lives on the Session:
-   *  cancel() must be able to record the debt. The idle handler absorbs
-   *  owed idles; an idle that arrives when NONE is owed while the active
-   *  turn is still unsettled means the SDK ended the turn without ever
-   *  emitting its result, so the turn will never settle on its own (issue
-   *  #825). Stream-level debt, deliberately NOT reset per turn: a lagged
-   *  idle can arrive after the next turn has already activated (issue
-   *  #773), and the debt is what attributes it to the turn that owed it.
-   *  Over-counting (an idle the SDK never emits) is benign: the counter
-   *  just absorbs one future idle, and detection degrades to the status quo
-   *  rather than misfiring. */
-  owedTrailingIdles: number;
   /** Maps the ACP `messageId` we expose to clients (see `messageIdForGrouping`)
    *  to the SDK message uuid that the Agent SDK's rewind/resume APIs key on
    *  (`Query.rewindFiles` takes a user-message uuid; `resumeSessionAt` takes an
@@ -574,52 +365,6 @@ type Session = {
    *  fork/rewind. */
   messageIdToUuid: Map<string, string>;
 };
-
-/** Result-message origin kinds that mark an AUTONOMOUS cycle — work the
- *  model did on its own (a task-notification followup, a peer/coordinator/
- *  observer message it handled) rather than the user's prompt. Absent,
- *  `human`, and `channel` origins are the user's own turn (this adapter's
- *  prompts arrive as the ACP channel on some CLI configurations — ALL
- *  channel servers are treated as user, so a foreign channel integration's
- *  autonomously-handled result is misclassified as the user's; accepted,
- *  see below), and `auto-continuation` continues the user's turn, so its
- *  result is the turn's real terminal.
- *
- *  Deliberately fail-OPEN: an unknown future kind defaults to the user
- *  lane. Misrouting a USER result into the autonomous lane hangs the
- *  prompt un-detectably (the result is skipped, its trailing idle absorbed
- *  as owed, so the #825 detector can't fire); misrouting an autonomous
- *  result into the user lane is the bounded misattribution class this set
- *  exists to reduce. */
-const AUTONOMOUS_RESULT_ORIGINS: ReadonlySet<SDKMessageOrigin["kind"]> = new Set([
-  "task-notification",
-  "peer",
-  "coordinator",
-  "observer",
-  "observer-activity",
-]);
-
-/** Whether this turn's terminal result arrived but its settlement is being
- *  held for background subagents it spawned (see Turn.deferredSettle). The
- *  single spelling of the hold predicate, shared by the consumer's settle
- *  lanes and cancel(). */
-function isHeldOpen(
-  turn: Turn | null | undefined,
-): turn is Turn & { deferredSettle: PromptResponse } {
-  return turn != null && turn.deferredSettle !== undefined && !turn.settled;
-}
-
-/** Disarm the force-cancel backstop (see Session.forceCancelTimer). Every
- *  path that settles the active turn must run this so a timer can never fire
- *  on an already-settled turn — and must leave the field undefined, or the
- *  arm site's !forceCancelTimer guard would refuse to arm the backstop for
- *  the NEXT turn's cancel. */
-function disarmForceCancel(session: Session): void {
-  if (session.forceCancelTimer) {
-    clearTimeout(session.forceCancelTimer);
-    session.forceCancelTimer = undefined;
-  }
-}
 
 /** Compute a stable fingerprint of the session-defining params so we can
  *  detect when a loadSession/resumeSession call requires tearing down and
@@ -691,50 +436,6 @@ type GatewayAuthMeta = {
 type GatewayAuthRequest = AuthenticateRequest & { _meta?: GatewayAuthMeta };
 
 /**
- * The single provider ID this agent exposes via `providers/*`. Claude Code has
- * one LLM backend selected by protocol (anthropic / bedrock / vertex), so there
- * is exactly one configurable provider.
- */
-const PROVIDER_ID = "main";
-
-/**
- * Protocols the `main` provider can be configured with. These mirror the
- * env-var mappings understood by {@link createEnvForProvider}.
- */
-const SUPPORTED_PROTOCOLS: LlmProtocol[] = ["anthropic", "bedrock", "vertex"];
-
-/**
- * Vertex needs project + region that the standard `providers/set` payload
- * (`apiType`/`baseUrl`/`headers`) does not model, so clients pass them through
- * `_meta.claudeCode.vertex`. Required only when `apiType === "vertex"`.
- */
-type SetProviderMeta = {
-  claudeCode?: {
-    vertex?: {
-      projectId: string;
-      region: string;
-    };
-  };
-};
-
-/**
- * Resolved, non-secret + secret routing config for the `main` provider. This is
- * the shared shape produced by both `providers/set` and the legacy gateway auth
- * path, and consumed by {@link createEnvForProvider}. `null` means the provider
- * is unconfigured (no client-managed routing in effect).
- */
-type ProviderConfig = {
-  apiType: LlmProtocol;
-  baseUrl: string;
-  headers: Record<string, string>;
-  /** Present only for `apiType === "vertex"`. */
-  vertex?: {
-    projectId: string;
-    region: string;
-  };
-};
-
-/**
  * Extra metadata that the agent provides for each tool_call / tool_update update.
  */
 export type ToolUpdateMeta = {
@@ -743,10 +444,6 @@ export type ToolUpdateMeta = {
     toolName: string;
     /* The structured output provided by Claude Code. */
     toolResponse?: unknown;
-    /* For a tool call made inside a subagent: the tool_use id of the
-       Agent/Task call that spawned the subagent. Mirrors the SDK's
-       `parent_tool_use_id` on streamed subagent messages. */
-    parentToolUseId?: string;
   };
   /* Terminal metadata for Bash tool execution, matching codex-acp's _meta protocol. */
   terminal_info?: {
@@ -771,83 +468,6 @@ export type ToolUseCache = {
     input: unknown;
   };
 };
-
-type StreamedToolInput = {
-  id: string;
-  name: string;
-  partialJson: string;
-  /** Offset into `partialJson` the scanner has consumed; each delta only scans
-   *  the newly appended fragment, so total scan work stays linear. */
-  scannedTo: number;
-  inString: boolean;
-  escaped: boolean;
-  objectDepth: number;
-  arrayDepth: number;
-  /** Offset of the most recent comma at the top level of the input object
-   *  (-1 before the first). Everything before it is a complete field. */
-  lastTopLevelComma: number;
-  /** The comma offset the last emitted refinement was sliced at (-1 before the
-   *  first), so a field boundary only triggers one recovery attempt. */
-  emittedThroughComma: number;
-};
-
-export type StreamedToolInputCache = Map<string, Map<number, StreamedToolInput>>;
-
-/**
- * Advance the lexer state across the fragment appended since the last delta:
- * just enough JSON awareness (string/escape, nesting depth) to spot commas
- * that sit at the top level of the input object — everything before such a
- * comma is a set of complete fields. Returns true once the input object's
- * closing brace arrives.
- */
-function scanStreamedToolInput(state: StreamedToolInput): boolean {
-  let complete = false;
-  for (let index = state.scannedTo; index < state.partialJson.length; index++) {
-    const character = state.partialJson[index];
-    if (state.inString) {
-      if (state.escaped) {
-        state.escaped = false;
-      } else if (character === "\\") {
-        state.escaped = true;
-      } else if (character === '"') {
-        state.inString = false;
-      }
-      continue;
-    }
-
-    if (character === '"') {
-      state.inString = true;
-    } else if (character === "{") {
-      state.objectDepth++;
-    } else if (character === "}") {
-      state.objectDepth--;
-      if (state.objectDepth === 0) {
-        complete = true;
-      }
-    } else if (character === "[") {
-      state.arrayDepth++;
-    } else if (character === "]") {
-      state.arrayDepth--;
-    } else if (character === "," && state.objectDepth === 1 && state.arrayDepth === 0) {
-      state.lastTopLevelComma = index;
-    }
-  }
-  state.scannedTo = state.partialJson.length;
-  return complete;
-}
-
-/** Parse the complete top-level fields before a top-level comma by closing the
- *  object at that boundary. */
-function recoveredToolInput(prefix: string): Record<string, unknown> | undefined {
-  try {
-    const value: unknown = JSON.parse(prefix + "}");
-    return value !== null && typeof value === "object" && !Array.isArray(value)
-      ? (value as Record<string, unknown>)
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
 
 export async function claudeCliPath(): Promise<string> {
   if (process.env.CLAUDE_CODE_EXECUTABLE) {
@@ -993,39 +613,6 @@ export function stripLocalCommandMetadata(content: unknown): unknown | null {
 
 export function isLocalCommandMetadata(content: unknown): boolean {
   return stripLocalCommandMetadata(content) === null;
-}
-
-/**
- * True for the synthetic assistant message the CLI injects into the transcript
- * when a turn fails authentication (e.g. "Not logged in · Please run /login",
- * "Session expired. Please run /login to sign in again."). The `/login`
- * instruction is Claude Code TUI-specific and meaningless to ACP clients
- * (issue #863). The live prompt loop suppresses the text and fails the turn
- * with `authRequired` so the client can run its own auth flow; replay must
- * skip it too — both for parity with what the client saw live and because the
- * message stays in the transcript forever, so it would resurface on every
- * session/load even after the user has logged back in.
- *
- * Takes the API message (`message.message`), which replay only knows as
- * `unknown`. The persisted record's structured `error: "authentication_failed"`
- * marker is stripped by `getSessionMessages`, so the synthetic model + text is
- * all both paths have to match on.
- */
-export function isSyntheticLoginMessage(apiMessage: unknown): boolean {
-  if (!apiMessage || typeof apiMessage !== "object") {
-    return false;
-  }
-  const { model, content } = apiMessage as { model?: unknown; content?: unknown };
-  if (model !== "<synthetic>" || !Array.isArray(content) || content.length !== 1) {
-    return false;
-  }
-  const block = content[0] as { type?: unknown; text?: unknown } | null;
-  return (
-    !!block &&
-    block.type === "text" &&
-    typeof block.text === "string" &&
-    block.text.includes("Please run /login")
-  );
 }
 
 const PERMISSION_MODE_ALIASES: Record<string, PermissionMode> = {
@@ -1204,10 +791,6 @@ export class ClaudeAcpAgent {
   clientCapabilities?: ClientCapabilities;
   logger: Logger;
   gatewayAuthRequest?: GatewayAuthRequest;
-  /** Client-managed LLM routing set via `providers/set`. Process-scoped and
-   *  never persisted to disk (see the Configurable LLM Providers RFD). When
-   *  set, it takes precedence over {@link gatewayAuthRequest}. */
-  providerConfig?: ProviderConfig;
   /** Grace period before a `session/cancel` forces a wedged prompt loop to
    *  return "cancelled". See {@link DEFAULT_FORCE_CANCEL_GRACE_MS}. Mutable so
    *  tests can shrink it. */
@@ -1334,7 +917,6 @@ export class ClaudeAcpAgent {
       agentCapabilities: {
         _meta: {
           claudeCode: {
-            promptQueueing: true,
             steer: {
               version: 1,
               appliedNotification: CLAUDE_STEER_APPLIED_METHOD,
@@ -1352,10 +934,6 @@ export class ClaudeAcpAgent {
         auth: {
           logout: {},
         },
-        // Client-managed LLM routing via `providers/list`, `providers/set`, and
-        // `providers/disable`. Advertised unconditionally; there is no client
-        // capability prerequisite for the provider methods.
-        providers: {},
         loadSession: true,
         sessionCapabilities: {
           additionalDirectories: {},
@@ -1493,115 +1071,11 @@ export class ClaudeAcpAgent {
     throw new Error("Method not implemented.");
   }
 
-  /**
-   * `providers/list` — returns the single client-configurable custom gateway
-   * provider (`main`). `current` carries only non-secret routing (never headers,
-   * which may hold secrets); only `apiType`/`baseUrl` are surfaced for UI
-   * display, and is `null` when the provider is not configured/disabled. The
-   * provider is optional (`required: false`): while disabled/unconfigured the
-   * agent falls back to its own default routing (normal Claude login).
-   */
-  async unstable_listProviders(_params: ListProvidersRequest): Promise<ListProvidersResponse> {
-    const config = this.resolveProviderConfig();
-    const provider: ProviderInfo = {
-      providerId: PROVIDER_ID,
-      supported: SUPPORTED_PROTOCOLS,
-      required: false,
-      current: config ? { apiType: config.apiType, baseUrl: config.baseUrl } : null,
-    };
-    return { providers: [provider] };
-  }
-
-  /**
-   * `providers/set` — replace the full configuration for the `main` provider.
-   * Rejects unknown IDs, unsupported protocols, and empty/invalid base URLs with
-   * `invalid_params`. Config is process-scoped and applies to sessions created or
-   * loaded after this call.
-   */
-  async unstable_setProvider(params: SetProviderRequest): Promise<SetProviderResponse> {
-    if (params.providerId !== PROVIDER_ID) {
-      throw RequestError.invalidParams(
-        { providerId: params.providerId },
-        `Unknown provider ID "${params.providerId}"; expected "${PROVIDER_ID}".`,
-      );
-    }
-    if (!SUPPORTED_PROTOCOLS.includes(params.apiType)) {
-      throw RequestError.invalidParams(
-        { apiType: params.apiType, supported: SUPPORTED_PROTOCOLS },
-        `Unsupported apiType "${params.apiType}" for provider "${PROVIDER_ID}".`,
-      );
-    }
-    if (!isValidBaseUrl(params.baseUrl)) {
-      throw RequestError.invalidParams(
-        { baseUrl: params.baseUrl },
-        "baseUrl must be a non-empty absolute http(s) URL.",
-      );
-    }
-
-    const config: ProviderConfig = {
-      apiType: params.apiType,
-      baseUrl: params.baseUrl,
-      headers: params.headers ?? {},
-    };
-
-    // Vertex requires project + region, which the standard payload cannot
-    // carry, so they arrive via `_meta.claudeCode.vertex`.
-    if (params.apiType === "vertex") {
-      const vertex = (params._meta as SetProviderMeta | undefined)?.claudeCode?.vertex;
-      if (
-        !vertex ||
-        typeof vertex.projectId !== "string" ||
-        vertex.projectId.trim() === "" ||
-        typeof vertex.region !== "string" ||
-        vertex.region.trim() === ""
-      ) {
-        throw RequestError.invalidParams(
-          undefined,
-          "vertex apiType requires non-empty `_meta.claudeCode.vertex.projectId` and `_meta.claudeCode.vertex.region`.",
-        );
-      }
-      config.vertex = { projectId: vertex.projectId, region: vertex.region };
-    }
-
-    this.providerConfig = config;
-    return {};
-  }
-
-  /**
-   * `providers/disable` — disabling the `main` provider clears any client-managed
-   * routing (both a `providers/set` config and the legacy gateway auth request),
-   * so the agent reverts to its own default routing and `providers/list` reports
-   * `current: null`. Disabling any other (unknown) ID is treated as a successful
-   * no-op per the RFD's idempotency rule.
-   */
-  async unstable_disableProvider(params: DisableProviderRequest): Promise<DisableProviderResponse> {
-    if (params.providerId === PROVIDER_ID) {
-      this.providerConfig = undefined;
-      this.gatewayAuthRequest = undefined;
-    }
-    // Unknown provider: idempotent success.
-    return {};
-  }
-
-  /**
-   * Resolve the effective client-managed routing config. `providers/set` takes
-   * precedence; otherwise fall back to the legacy gateway auth request. Returns
-   * `null` when neither is configured.
-   */
-  resolveProviderConfig(): ProviderConfig | null {
-    if (this.providerConfig) {
-      return this.providerConfig;
-    }
-    return gatewayRequestToProviderConfig(this.gatewayAuthRequest);
-  }
-
   async logout(_params: LogoutRequest): Promise<void> {
-    // Clear in-memory gateway credentials supplied via `authenticate` and any
-    // provider routing set via `providers/set`. Neither touches the on-disk
-    // credential store, so dropping these references is the whole logout for
-    // those paths.
+    // Clear in-memory gateway credentials supplied via `authenticate`. The
+    // gateway method never touches the on-disk credential store, so dropping
+    // this reference is the whole logout for that path.
     this.gatewayAuthRequest = undefined;
-    this.providerConfig = undefined;
 
     // For the Claude/Console login methods the credentials live in the native
     // CLI's store (keychain or config dir), which only the binary can clear.
@@ -1658,6 +1132,9 @@ export class ClaudeAcpAgent {
       clientSteerId,
       isLocalOnlyCommand,
       settled: false,
+      pendingTaskIds: new Set(),
+      startedBackgroundTask: false,
+      waitForBackgroundIdle: false,
       resolve: () => {},
       reject: () => {},
     };
@@ -1733,35 +1210,23 @@ export class ClaudeAcpAgent {
     // gateways that don't carry a stable/matching id across the stream and the
     // consolidated message. Reset after each consolidated message consumes it.
     const streamedBlocks: { index: number; type: "text" | "thinking"; text: string }[] = [];
-    // Tool-use blocks start streaming before their JSON input. Keep the
-    // partial input per parent message and block index so completed top-level
-    // fields can refine the pending tool call while it streams. Entries are
-    // dropped at block/message boundaries; the whole map is swept when a turn
-    // settles, since an interrupted subagent stream (keyed by a
-    // parent_tool_use_id that never recurs) has no boundary event of its own.
-    const streamedToolInputs: StreamedToolInputCache = new Map();
     // Stop reason accumulated for the active turn (result subtype, refusal,
     // max_tokens, …). Reset per turn; read when the turn settles at idle.
     let stopReason: StopReason = "end_turn";
-    /** The consumer's single send chokepoint: every `sessionUpdate` in this
-     *  loop goes through here (never `this.client.sessionUpdate` directly) so
-     *  answer-delivery tracking is a property of sending, not something each
-     *  emission site must remember. A top-level `agent_message_chunk` marks
-     *  the stretch's answer as delivered; subagent-attributed chunks are
-     *  recognizable by the `parentToolUseId` meta that toAcpNotifications
-     *  stamps from `parent_tool_use_id`, and never reach the top-level feed
-     *  as the turn's answer. */
-    const sendUpdate = async (notification: SessionNotification) => {
-      const { update } = notification;
-      if (update.sessionUpdate === "agent_message_chunk") {
-        const claudeMeta = update._meta?.claudeCode as
-          { parentToolUseId?: string | null } | undefined;
-        if (!claudeMeta?.parentToolUseId) {
-          session.emittedAssistantText = true;
-        }
-      }
-      await this.client.sessionUpdate(notification);
-    };
+    // How many trailing `session_state_changed: idle` messages are already
+    // accounted for: every user-turn result that terminates a turn (settle,
+    // reject, or orphan skip) is followed by one, as is a cancelled turn
+    // settled by the next turn's echo hand-off. The idle handler absorbs owed
+    // idles; an idle that arrives when NONE is owed while the active turn is
+    // still unsettled means the SDK ended the turn without ever emitting its
+    // result, so the turn will never settle on its own (issue #825).
+    // Stream-level debt, deliberately NOT reset per turn: a lagged idle can
+    // arrive after the next turn has already activated (issue #773), and the
+    // debt is what attributes it to the turn that owed it. Over-counting (an
+    // idle the SDK never emits, e.g. CLI binaries without session-state
+    // events — issue #497) is benign: the counter just absorbs one future
+    // idle, and detection degrades to the status quo rather than misfiring.
+    let owedTrailingIdles = 0;
 
     const resetTurnScratch = () => {
       lastAssistantTotalUsage = null;
@@ -1799,30 +1264,6 @@ export class ClaudeAcpAgent {
       session.activeTurn = turn;
       session.cancelled = false;
       session.pendingOrphanResults = 0;
-      session.orphanCommands?.clear();
-      // Two-phase sweep of registry entries the level signal ended (see
-      // the endedPerLevel field doc): armed at the first activation,
-      // deleted at the second — the same activation-time self-heal as the
-      // orphan lanes, and the growth bound for leaked entries whose settle
-      // bookends never arrive. The one-activation grace lets a corrective
-      // inclusive level rescue a live async agent that a racing payload
-      // absent-marked (deletion is irreversible: levels never ADD entries).
-      // Local-only commands don't advance the clock: two quick /context
-      // calls would otherwise burn the whole grace in seconds of wall time
-      // while the corrective level is still in flight, and they interact
-      // with no tasks — a later real turn still bounds growth.
-      if (!turn.isLocalOnlyCommand) {
-        for (const [taskId, record] of session.liveBackgroundTasks) {
-          if (!record.endedPerLevel) {
-            continue;
-          }
-          if (record.endedPerLevel === "sweep-armed") {
-            session.liveBackgroundTasks.delete(taskId);
-          } else {
-            record.endedPerLevel = "sweep-armed";
-          }
-        }
-      }
       resetTurnScratch();
       if (turn.clientSteerId) {
         await this.client.extNotification(CLAUDE_STEER_APPLIED_METHOD, {
@@ -1849,248 +1290,129 @@ export class ClaudeAcpAgent {
      *  result), so we skip those and only promote once the count is drained. */
     const ensureActiveTurn = async () => {
       if (session.activeTurn) {
-        if (!isHeldOpen(session.activeTurn)) {
-          return;
-        }
-        // A held turn (Turn.deferredSettle) already produced its result, so
-        // this incoming user-turn result cannot be its — it belongs to the
-        // next queued command (an echo-less one, e.g. `/context` sent while
-        // the hold drains; a normal prompt's echo would have handed the held
-        // turn off before its result). Settle the held turn with its
-        // recorded outcome — the user moving on outranks the hold, same
-        // contract as the echo hand-off — and fall through to promote the
-        // queue head, which this result belongs to. Without this, the head
-        // would never be promoted (echo-less turns have no other promotion
-        // path) and its prompt would hang, while this result's outcome
-        // overwrote the held turn's. Orphan lanes below are necessarily
-        // empty while a turn is held: orphans are seeded by cancel(), which
-        // inline-settles a held turn, and activation cleared older ones.
-        // settleActive also closes the held turn's delivery stretch, so the
-        // promoted command's own delivery decision is not judged against the
-        // held turn's followup text (issue #453) — the caller snapshots the
-        // flag AFTER this runs.
-        settleActive(session.activeTurn.deferredSettle);
-      }
-      // Orphan accounting runs BEFORE the head check: an orphan's echo-less
-      // result can arrive with an EMPTY queue (the common post-cancel
-      // timeline — the active turn settled at the interrupt's idle and the
-      // user hasn't typed yet), and it must still be consumed here. Skipping
-      // the bookkeeping when there is nothing to promote would leave a
-      // phantom entry/count that swallows the next live echo-less result
-      // (e.g. /compact) instead.
-      if ((session.pendingOrphanResults ?? 0) > 0) {
-        session.pendingOrphanResults!--;
         return;
       }
-      // msg_lifecycle_v1 lane. Attribute this echo-less result using the
-      // entries' states — turns run sequentially and frames arrive in stream
-      // order, so at any result: every "zombie" is from an already-dead turn
-      // whose own result already passed before the frame that created the
-      // newest entry (or never existed), every "started" entry was dispatched
-      // into THE turn that emitted this result (an older turn's entries got
-      // their terminal frames before a newer turn's "started" frames), and a
-      // "pending" entry was not dispatched before it. One result therefore
-      // covers ALL started and zombie entries at once (N coalesced commands
-      // share ONE result); their outstanding terminal frames then no-op on
-      // the missing entries. NOTE this ordering argument is asserted from
-      // observed CLI behavior, not a documented wire contract — if a dead
-      // turn's late result could lag past the NEXT turn's dispatch frames,
-      // deleting a zombie and a started entry on one result would
-      // double-consume it. The unexpected-transition logging in the frame
-      // handler is the tripwire for that class of drift.
-      if (session.orphanCommands?.size) {
-        let consumedOrphanResult = false;
-        let oldestPending: string | undefined;
-        for (const [uuid, state] of session.orphanCommands) {
-          if (state === "started" || state === "zombie") {
-            consumedOrphanResult = true;
-            session.orphanCommands.delete(uuid);
-          } else {
-            oldestPending ??= uuid;
-          }
-        }
-        if (consumedOrphanResult) {
-          return;
-        }
-        if (oldestPending !== undefined) {
-          // No dispatch was seen before this result, so it is very likely a
-          // live turn's — but a lost "started" frame would mean it IS the
-          // orphan's (dup-over-loss: prefer one wrong skip over
-          // misattributing a dead turn's outcome to a live prompt). Grant
-          // each pending entry exactly one skip, like the count lane did.
-          session.orphanCommands.delete(oldestPending);
-          return;
-        }
-      }
-      const head = firstUnsettledQueuedTurn();
+      const head = (session.turnQueue ?? []).find((t) => !t.settled && !t.pendingCompletion);
       if (!head) {
+        return;
+      }
+      if ((session.pendingOrphanResults ?? 0) > 0) {
+        session.pendingOrphanResults!--;
         return;
       }
       await activateTurn(head);
     };
 
-    /** Result-time bookkeeping that must run whether or not the result can be
-     *  attributed to a turn. (1) Latch `commandResultSeen` on every queued
-     *  turn whose command is known dispatched with no terminal frame yet —
-     *  the emitting turn is the one it was dispatched (possibly folded) into,
-     *  so its result has now passed; a later cancel() must not seed an orphan
-     *  entry that waits for it (see Turn.commandResultSeen). (2) When a turn
-     *  is ACTIVE, the result is attributed to it and never reaches
-     *  ensureActiveTurn — but it still covers the map's started entries
-     *  (commands folded into the active turn share its result) and zombies
-     *  (their late results have already passed or never existed), so drain
-     *  them here or they would zombify/linger and swallow a later live
-     *  echo-less result. */
-    const recordResultForOrphanCommands = () => {
-      for (const turn of session.turnQueue ?? []) {
-        if (!turn.settled && turn.commandStarted && !turn.commandFinished) {
-          turn.commandResultSeen = true;
-        }
-      }
-      if (session.activeTurn && session.orphanCommands?.size) {
-        for (const [uuid, state] of session.orphanCommands) {
-          if (state === "started" || state === "zombie") {
-            session.orphanCommands.delete(uuid);
+    const clearTurnTaskTracking = (turn: Turn) => {
+      if (session.taskOwners) {
+        for (const taskId of turn.pendingTaskIds) {
+          if (session.taskOwners.get(taskId) === turn) {
+            session.taskOwners.delete(taskId);
           }
         }
       }
+      turn.pendingTaskIds.clear();
     };
 
-    /** The unsettled in-flight turn owning this prompt uuid, if any. */
-    const findUnsettledTurn = (uuid: string) =>
-      (session.turnQueue ?? []).find((t) => t.promptUuid === uuid && !t.settled);
-
-    /** The first queued turn still awaiting its outcome, if any — the single
-     *  spelling of "a prompt is pending" shared by the head promotion and
-     *  the autonomous stretch-close guard. */
-    const firstUnsettledQueuedTurn = () => (session.turnQueue ?? []).find((t) => !t.settled);
-
-    /** Whether any background subagent this turn spawned is still live —
-     *  while true, the turn's settlement stays deferred so the subagent's
-     *  output and permission requests land inside it (see
-     *  Turn.deferredSettle). */
-    const turnAwaitingSubagents = (turn: Turn) => {
-      if (!turn.spawnedTaskIds?.size) {
-        return false;
-      }
-      for (const taskId of turn.spawnedTaskIds) {
-        const record = session.liveBackgroundTasks.get(taskId);
-        // The isSubagent read is defense in depth for the shells-never-defer
-        // contract: spawnedTaskIds only ever holds subagent ids today, but a
-        // future add site must not silently let a long-lived shell hold a
-        // prompt open. endedPerLevel entries are kept for attribution only —
-        // the level signal says the task is gone (or its bookends were
-        // lost), so a hold must not wait on them.
-        if (record?.isSubagent && !record.endedPerLevel) {
-          return true;
-        }
-      }
-      return false;
-    };
-
-    /** Settle the active turn's stored deferred outcome once none of its
-     *  spawned subagents is live. The single drain rule shared by the
-     *  followup-result and idle settle sites, so the two lanes can't drift. */
-    const settleDeferredIfDrained = () => {
-      const turn = session.activeTurn;
-      if (isHeldOpen(turn) && !turnAwaitingSubagents(turn)) {
-        settleActive(turn.deferredSettle);
-      }
-    };
-
-    /** Settle the active turn with `outcome` now — unless subagents it
-     *  spawned are still live, in which case store the outcome and hold the
-     *  turn open (see Turn.deferredSettle). Every result-time settle of a
-     *  turn that can have spawned subagents must route through here: a site
-     *  calling settleActive directly bypasses the hold and re-opens the
-     *  out-of-turn permission deadlock (issue #866) through its lane. */
-    const settleOrDefer = (outcome: PromptResponse) => {
-      if (
-        session.activeTurn &&
-        !session.activeTurn.settled &&
-        turnAwaitingSubagents(session.activeTurn)
-      ) {
-        session.activeTurn.deferredSettle = outcome;
-      } else {
-        settleActive(outcome);
-      }
-    };
-
-    /** Settle the active turn's deferred exactly once, disarm the force-cancel
-     *  backstop (the turn is over), and drop it from the queue. */
-    const settleActive = (result: PromptResponse) => {
-      const turn = session.activeTurn;
-      if (!turn || turn.settled) {
+    /** Settle a turn's deferred exactly once and drop it from the queue. The
+     *  turn may be the active one or an earlier turn waiting for background
+     *  tasks to drain while a later queued prompt is already active. */
+    const settleTurn = (turn: Turn, result: PromptResponse) => {
+      if (turn.settled) {
         return;
       }
-      // Captured before the settled flip below (isHeldOpen tests !settled).
-      const wasHeld = isHeldOpen(turn);
       turn.settled = true;
-      disarmForceCancel(session);
+      if (session.activeTurn === turn && session.forceCancelTimer) {
+        clearTimeout(session.forceCancelTimer);
+        session.forceCancelTimer = undefined;
+      }
+      clearTurnTaskTracking(turn);
+      turn.startedBackgroundTask = false;
+      turn.pendingCompletion = undefined;
+      turn.waitForBackgroundIdle = false;
       session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== turn);
-      session.activeTurn = null;
-      streamedToolInputs.clear();
-      if (wasHeld) {
-        // Settling a held turn is its delivery-stretch boundary: the turn's
-        // answer finished long ago, so text streamed since the last boundary
-        // is normally its followups' — left latched it would suppress a
-        // following replayed turn's issue-#453 result-text fallback (the
-        // common post-hold sequence). Known trade: at the echo hand-off an
-        // incoming turn's pre-echo deltas share this one boolean, so a
-        // STREAMING replay on a usage-omitting backend could re-emit its
-        // answer — the flag cannot attribute text to a turn before its
-        // echo, and the suppression direction is the common one, so the
-        // clear wins. Every held-settle lane inherits this: the drain
-        // settle, both hand-offs, and stream-done; cancel()'s inline mirror
-        // carries its own copy.
-        session.emittedAssistantText = false;
+      if (session.activeTurn === turn) {
+        session.activeTurn = null;
       }
       turn.resolve(result);
     };
 
-    /** Reject the active turn (auth required, error result, …) without tearing
-     *  down the consumer: the stream continues to idle and later turns proceed. */
-    const failActive = (error: unknown) => {
-      disarmForceCancel(session);
+    /** Settle the active turn, if there is one. */
+    const settleActive = (result: PromptResponse) => {
+      const turn = session.activeTurn;
+      if (!turn) {
+        return;
+      }
+      settleTurn(turn, result);
+    };
+
+    const deferActiveUntilBackgroundDrain = (result: PromptResponse) => {
       const turn = session.activeTurn;
       if (!turn || turn.settled) {
         return;
       }
-      turn.settled = true;
-      session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== turn);
-      session.activeTurn = null;
-      streamedToolInputs.clear();
-      // A failed turn's stretch is over, and some failure lanes (the issue
-      // #825 idle-fail) never see the result whose `finally` would close it —
-      // start the next stretch clean, or its stale delivery record would
-      // suppress the next turn's issue-#453 result-text fallback.
-      session.emittedAssistantText = false;
-      turn.reject(error);
+      if (!turn.startedBackgroundTask) {
+        settleTurn(turn, result);
+        return;
+      }
+      turn.pendingCompletion = result;
+      turn.waitForBackgroundIdle = true;
+      // This turn's trailing idle is the drain marker that will release the
+      // pending completion, not an owed idle to absorb for an already-settled
+      // turn. Result handling pre-counts the idle for #825 protection, so take
+      // that count back when the completion is intentionally deferred.
+      if (owedTrailingIdles > 0) {
+        owedTrailingIdles--;
+      }
     };
 
-    /** Reject every in-flight turn — used when the stream dies. */
-    const failAllTurns = (error: unknown) => {
-      disarmForceCancel(session);
-      const turns = session.activeTurn
-        ? [session.activeTurn, ...(session.turnQueue ?? []).filter((t) => t !== session.activeTurn)]
-        : [...(session.turnQueue ?? [])];
-      session.activeTurn = null;
-      session.turnQueue = [];
-      for (const turn of turns) {
-        if (!turn.settled) {
-          const wasHeld = isHeldOpen(turn);
-          turn.settled = true;
-          if (wasHeld) {
-            // A held turn's answer already streamed and its outcome is
-            // recorded — a stream death during the post-answer hold is a
-            // background failure, not the turn's. Resolve with the real
-            // outcome, mirroring the stream-done path.
-            turn.resolve(turn.deferredSettle);
-          } else {
-            turn.reject(error);
-          }
+    const settleBackgroundIdleWaiters = () => {
+      let settledAny = false;
+      for (const turn of [...(session.turnQueue ?? [])]) {
+        if (
+          !turn.settled &&
+          turn.pendingCompletion &&
+          turn.waitForBackgroundIdle &&
+          turn.pendingTaskIds.size === 0
+        ) {
+          settleTurn(turn, turn.pendingCompletion);
+          settledAny = true;
         }
       }
+      return settledAny;
+    };
+
+    const settlePendingCompletions = () => {
+      for (const turn of [...(session.turnQueue ?? [])]) {
+        if (!turn.settled && turn.pendingCompletion) {
+          settleTurn(turn, turn.pendingCompletion);
+        }
+      }
+    };
+
+    const trackBackgroundTask = (taskId: string, options?: { skipTranscript?: boolean }) => {
+      const turn = session.activeTurn;
+      // Ambient housekeeping tasks are not part of the visible assistant turn;
+      // waiting on them would make hidden title/index work delay end_turn.
+      if (!turn || turn.settled || options?.skipTranscript) {
+        return;
+      }
+      turn.pendingTaskIds.add(taskId);
+      turn.startedBackgroundTask = true;
+      session.taskOwners ??= new Map();
+      session.taskOwners.set(taskId, turn);
+    };
+
+    const finishBackgroundTask = (taskId: string) => {
+      const turn = session.taskOwners?.get(taskId);
+      if (!turn || turn.settled) {
+        return;
+      }
+      turn.pendingTaskIds.delete(taskId);
+      session.taskOwners?.delete(taskId);
+      // The terminal task event is not quite the safe end of the turn: the SDK
+      // may still emit task-notification follow-up output. The next idle is the
+      // drain marker for turns that had to wait on background work.
     };
 
     const emitTaskLifecycle = async (message: SDKMessage) => {
@@ -2107,6 +1429,50 @@ export class ClaudeAcpAgent {
         acpSessionId,
         message: message as unknown as Record<string, unknown>,
       });
+    };
+
+    /** Reject the active turn (auth required, error result, …) without tearing
+     *  down the consumer: the stream continues to idle and later turns proceed. */
+    const failActive = (error: unknown) => {
+      if (session.forceCancelTimer) {
+        clearTimeout(session.forceCancelTimer);
+        session.forceCancelTimer = undefined;
+      }
+      const turn = session.activeTurn;
+      if (!turn || turn.settled) {
+        return;
+      }
+      turn.settled = true;
+      clearTurnTaskTracking(turn);
+      turn.startedBackgroundTask = false;
+      turn.pendingCompletion = undefined;
+      turn.waitForBackgroundIdle = false;
+      session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== turn);
+      session.activeTurn = null;
+      turn.reject(error);
+    };
+
+    /** Reject every in-flight turn — used when the stream dies. */
+    const failAllTurns = (error: unknown) => {
+      if (session.forceCancelTimer) {
+        clearTimeout(session.forceCancelTimer);
+        session.forceCancelTimer = undefined;
+      }
+      const turns = session.activeTurn
+        ? [session.activeTurn, ...(session.turnQueue ?? []).filter((t) => t !== session.activeTurn)]
+        : [...(session.turnQueue ?? [])];
+      session.activeTurn = null;
+      session.turnQueue = [];
+      for (const turn of turns) {
+        if (!turn.settled) {
+          turn.settled = true;
+          clearTurnTaskTracking(turn);
+          turn.startedBackgroundTask = false;
+          turn.pendingCompletion = undefined;
+          turn.waitForBackgroundIdle = false;
+          turn.reject(error);
+        }
+      }
     };
 
     // The wake-up channel cancel()/teardown aborts to force the active turn to
@@ -2150,42 +1516,9 @@ export class ClaudeAcpAgent {
           // turn being abandoned. Stale counts self-heal: activation resets
           // them (see activateTurn).
           if (session.activeTurn && !session.activeTurn.settled) {
-            // Seed by what the frames already told us, mirroring cancel()'s
-            // queued-turn sweep — the consumer may have drained the wedged
-            // turn's result and/or terminal frame before the backstop fired,
-            // and an entry seeded for a result or frame that is already
-            // spent would never drain (it would swallow an unrelated later
-            // echo-less result instead).
-            const active = session.activeTurn;
-            if (active.commandFinished === "completed" || active.commandFinished === "discarded") {
-              // Finished SDK-side; any result already passed. Nothing to
-              // track.
-            } else if (active.commandFinished === "cancelled") {
-              // Aborted after dispatch: its late result may still come —
-              // unless it already did.
-              if (!active.commandResultSeen) {
-                this.trackOrphanCommand(session, active.promptUuid, "zombie");
-              }
-            } else if (active.commandResultSeen) {
-              // Its result was already consumed (dropped at the cancelled
-              // guard); only the terminal frame is outstanding, which no-ops
-              // with no entry. Nothing to track.
-            } else {
-              // The wedged turn WAS dispatched (it's active), so track it
-              // "started": its late result (if the SDK recovers) is skipped
-              // echo-less, and its terminal frame — or that skip plus
-              // activation's clear when the frame is lost to the wedge — is
-              // what drains it.
-              this.trackOrphanCommand(session, active.promptUuid, "started");
-            }
+            session.pendingOrphanResults = (session.pendingOrphanResults ?? 0) + 1;
           }
-          settleActive({ stopReason: "cancelled", usage: sessionUsage(session) });
-          // The cancelled turn's result may never come (that's why the
-          // backstop fired) — close its delivery stretch here so partial
-          // streamed text can't suppress the next turn's issue-#453 fallback.
-          // If a late orphan result does arrive, its `finally` clears again;
-          // FIFO ordering means no live turn's text can have streamed yet.
-          session.emittedAssistantText = false;
+          settleActive({ stopReason: "cancelled" });
           // If the session is being torn down, abandon the in-flight next()
           // (swallowing any later rejection so it can't surface as unhandled)
           // and stop; otherwise re-arm and keep consuming — `pendingNext`
@@ -2212,16 +1545,12 @@ export class ClaudeAcpAgent {
           // turn's real outcome.
           //
           // Settle the turn that was in flight so its prompt() doesn't hang:
-          // cancelled if a cancel is pending, otherwise the outcome a
-          // deferred turn already recorded (see Turn.deferredSettle) or the
-          // accumulated scratch outcome. The scratch currently still equals
-          // a deferred turn's stored outcome (followup results never mutate
-          // it), but the stored one is the authoritative source.
-          const inFlight = session.activeTurn;
+          // cancelled if a cancel is pending, otherwise the accumulated outcome.
+          settlePendingCompletions();
           settleActive(
             session.cancelled
-              ? { stopReason: "cancelled", usage: sessionUsage(session) }
-              : (inFlight?.deferredSettle ?? { stopReason, usage: sessionUsage(session) }),
+              ? { stopReason: "cancelled" }
+              : { stopReason, usage: sessionUsage(session) },
           );
           // Queued turns the SDK never started never ran, so reject them rather
           // than reporting a success (end_turn) — or a misleading "cancelled" —
@@ -2253,119 +1582,19 @@ export class ClaudeAcpAgent {
           });
         }
 
-        // CLIs 2.1.206+ (capability msg_lifecycle_v1) report the fate of every
-        // uuid-stamped queued command (queued/started/completed/cancelled/
-        // discarded) as `command_lifecycle` frames — 2-3 per prompt, since
-        // prompt() stamps a uuid on every message. The frame is @internal and
-        // absent from the SDKMessage union, so handle it BEFORE the exhaustive
-        // switch: it must not reach `unreachable`'s error log, and a `case`
-        // for it wouldn't typecheck. It feeds only the orphan accounting (see
-        // Session.orphanCommands); turn settlement stays driven by
-        // echoes/results/idle. (Raw-mode emission above still forwards these
-        // frames.)
-        if ((message as { type: string }).type === "command_lifecycle") {
-          const frame = message as unknown as { command_uuid: string; state: string };
-          switch (frame.state) {
-            case "started": {
-              // Remember dispatch on the live turn so a cancel() that orphans
-              // it seeds the right state (see Turn.commandStarted)...
-              const queued = findUnsettledTurn(frame.command_uuid);
-              if (queued) {
-                queued.commandStarted = true;
-              }
-              // ...and promote an already-orphaned command: once dispatched,
-              // a bare `cancelled` no longer means "dropped without running".
-              const state = session.orphanCommands?.get(frame.command_uuid);
-              if (state === "pending") {
-                session.orphanCommands!.set(frame.command_uuid, "started");
-              } else if (state === "zombie") {
-                // "started" after the command's terminal frame: the ordering
-                // the whole lane rests on has been violated (frames are
-                // per-uuid FIFO). Surface it — a silent drift here degrades
-                // into swallowed or misattributed results.
-                this.logger.error(
-                  `Session ${params.sessionId}: command_lifecycle "started" for ${frame.command_uuid} after its terminal frame; orphan accounting may be off for this cancel.`,
-                );
-              }
-              break;
-            }
-            case "completed":
-            case "discarded":
-            case "cancelled": {
-              // Terminal frames. Latch the fate on a still-queued turn so a
-              // later cancel() doesn't seed an orphan entry for a command
-              // whose one-and-only terminal frame has already been consumed
-              // (nothing would ever drain that entry).
-              const queued = findUnsettledTurn(frame.command_uuid);
-              if (queued) {
-                queued.commandFinished = frame.state as "completed" | "discarded" | "cancelled";
-              }
-              if (frame.state === "cancelled") {
-                // Ambiguous by design (dup-over-loss): dropped before
-                // dispatch (no result will ever come — safe to forget) vs
-                // consumed into a turn that was aborted/failed. For the
-                // latter, any result the dead turn managed to emit has
-                // already deleted the entry (see
-                // recordResultForOrphanCommands / ensureActiveTurn), so a
-                // still-"started" entry means no result was seen since
-                // dispatch — it becomes a zombie for the next
-                // echo-less-result skip.
-                const state = session.orphanCommands?.get(frame.command_uuid);
-                if (state === "pending") {
-                  session.orphanCommands?.delete(frame.command_uuid);
-                } else if (state === "started") {
-                  session.orphanCommands?.set(frame.command_uuid, "zombie");
-                }
-                break;
-              }
-              // Exactly-one-terminal: the command is finished. "completed" is
-              // emitted after any result its turn produced (fresh turn) or the
-              // command folded into another turn whose result is attributed
-              // elsewhere — either way no echo-less result remains to skip.
-              // "discarded" = session ended with it still queued; no result.
-              session.orphanCommands?.delete(frame.command_uuid);
-              break;
-            }
-            default:
-              // "queued" carries no fate information. Anything else is a
-              // state this adapter doesn't know — likely a CLI that grew the
-              // v1 vocabulary. The entry still drains by result coverage or
-              // activation's clear (bounded damage), but log it so the
-              // degradation is visible instead of silent.
-              if (frame.state !== "queued") {
-                this.logger.error(
-                  `Session ${params.sessionId}: unknown command_lifecycle state "${frame.state}" for ${frame.command_uuid}; treating as uninformative.`,
-                );
-              }
-              break;
-          }
-          continue;
-        }
-
         switch (message.type) {
           case "system":
             switch (message.subtype) {
               case "init":
-                // Latch the lifecycle capability so cancel() routes orphan
-                // accounting through `orphanCommands` (per-uuid, exact)
-                // instead of the coalescing-blind count. Never unlatch: init
-                // re-emits per turn and the capability can't be lost mid-CLI.
-                if (message.capabilities?.includes("msg_lifecycle_v1")) {
-                  session.msgLifecycleV1 = true;
-                }
                 // A fresh `system`/init (e.g. after reinitialize) can carry an
                 // updated Fast mode state; reconcile it with what we seeded at
                 // session creation.
                 await this.syncFastModeState(message.session_id, session, message.fast_mode_state);
                 break;
               case "status": {
-                // These banners count as delivered text (via sendUpdate), so
-                // an echo-less turn that only ever emits them (e.g. `/compact`,
-                // promoted at its own result) doesn't have its result text
-                // re-emitted by the issue-#453 fallback.
                 if (message.status === "compacting") {
                   compactionInProgress = true;
-                  await sendUpdate({
+                  await this.client.sessionUpdate({
                     sessionId: message.session_id,
                     update: {
                       sessionUpdate: "agent_message_chunk",
@@ -2377,7 +1606,7 @@ export class ClaudeAcpAgent {
                   // message carrying `compact_result`, not the `compact_boundary`
                   // message (which only fires when there's content to compact).
                   compactionInProgress = false;
-                  await sendUpdate({
+                  await this.client.sessionUpdate({
                     sessionId: message.session_id,
                     update: {
                       sessionUpdate: "agent_message_chunk",
@@ -2387,7 +1616,7 @@ export class ClaudeAcpAgent {
                 } else if (message.compact_result === "failed" && compactionInProgress) {
                   compactionInProgress = false;
                   const reason = message.compact_error ? `: ${message.compact_error}` : ".";
-                  await sendUpdate({
+                  await this.client.sessionUpdate({
                     sessionId: message.session_id,
                     update: {
                       sessionUpdate: "agent_message_chunk",
@@ -2412,9 +1641,9 @@ export class ClaudeAcpAgent {
                 // dropped dramatically) and replaced within seconds by the next
                 // result message.
                 //
-                // `size` keeps coming from session.contextWindowSize —
-                // compaction frees occupancy, it doesn't change the model's
-                // window.
+                // `size` keeps coming from session.contextWindowSize (learned
+                // from modelUsage / the model heuristic) — getContextUsage's
+                // window field under-reports extended 1M windows.
                 //
                 // The "Compacting completed." text is emitted from the `status`
                 // handler (keyed on `compact_result`), not here, so the failure
@@ -2422,7 +1651,7 @@ export class ClaudeAcpAgent {
                 const usedTokens = await fetchContextUsedTokens(session.query, this.logger);
                 lastAssistantUsage = null;
                 lastAssistantTotalUsage = usedTokens ?? 0;
-                await sendUpdate({
+                await this.client.sessionUpdate({
                   sessionId: message.session_id,
                   update: {
                     sessionUpdate: "usage_update",
@@ -2433,7 +1662,7 @@ export class ClaudeAcpAgent {
                 break;
               }
               case "local_command_output": {
-                await sendUpdate({
+                await this.client.sessionUpdate({
                   sessionId: message.session_id,
                   update: {
                     sessionUpdate: "agent_message_chunk",
@@ -2443,82 +1672,32 @@ export class ClaudeAcpAgent {
                 break;
               }
               case "session_state_changed": {
-                session.lastSessionState = message.state;
                 if (message.state === "idle") {
-                  // A non-cancelled turn normally settled at its terminal
-                  // `result` already (issue #773), and that result recorded an
-                  // owed trailing idle — absorbed here via the decrement. We
-                  // must NOT settle `activeTurn` on an owed idle: `idle`
-                  // carries no turn identity, and it can lag (the SDK flushes
-                  // held-back results / drains background agents first), so by
-                  // the time it arrives the SDK may have echoed the NEXT turn
-                  // and activated it — settling now would resolve that new
-                  // turn prematurely with end_turn and ~zero usage, dropping
-                  // its real result. A cancelled turn relies on `idle`: its
-                  // `result` is dropped at the `session.cancelled` guard, so
-                  // it never settles at a result and must settle here.
+                  // Most turns settle at their terminal `result` (issue #773),
+                  // and those results record owed trailing idles that are
+                  // absorbed here. Turns that reached `result` with background
+                  // SDK tasks still running are different: their response is
+                  // intentionally held until task terminal events and this idle
+                  // drain marker arrive.
                   //
-                  // An idle that is NOT owed while the active turn is still
-                  // unsettled is the issue #825 signature: `idle` is the SDK's
-                  // authoritative turn-over signal (it fires after held-back
-                  // results flush and background agents drain), so a turn that
-                  // reaches it without a result will never get one — the model
-                  // stream dropped mid-turn, or an async agent
-                  // completed/stalled without the host turn resolving. Fail
-                  // the turn NOW so its session/prompt gets a terminal
-                  // response, instead of leaving it hanging until the next
-                  // prompt drains the wreckage.
-                  // A cancelled turn still consumed tokens: its dropped result
-                  // already fed the accumulator (the usage tally at the result
-                  // handler runs before the `session.cancelled` guard), so
-                  // report it — clients metering spend would otherwise lose
-                  // the interrupted turn's tokens entirely (issue #844). Zero
-                  // when the cancel pre-empted the result (wedge/force-cancel).
+                  // An idle that is neither owed nor a background drain while
+                  // the active turn is still unsettled is the issue #825
+                  // signature: the SDK declared the turn over without emitting
+                  // its result, so fail the in-flight prompt instead of leaving
+                  // it hanging.
                   if (session.cancelled && session.activeTurn && !session.activeTurn.settled) {
-                    settleActive({ stopReason: "cancelled", usage: sessionUsage(session) });
-                    // An interrupt can pre-empt the turn's result entirely
-                    // (nothing ran the result-case `finally`), so close the
-                    // delivery stretch here: idle is the SDK's authoritative
-                    // turn-over signal, and stale partial-text state would
-                    // suppress the next turn's issue-#453 fallback.
-                    session.emittedAssistantText = false;
-                  } else if (isHeldOpen(session.activeTurn)) {
-                    // A turn held open for its background subagents (see
-                    // Turn.deferredSettle). Idles keep their normal cadence
-                    // during the hold — the CLI emits one per processing
-                    // cycle (the turn's own trailer, then one per followup),
-                    // NOT one final "all drained" signal — so each one
-                    // absorbs an outstanding trailer debt, and the turn only
-                    // settles once none of its spawned subagents is left
-                    // (the followup-result settle usually got there first;
-                    // this is the fallback when no followup came). Mid-hold
-                    // idles never fall through: a held turn HAS its result,
-                    // so reading its idle as "turn abandoned without a
-                    // result" (issue #825) would fail a healthy prompt.
-                    if (session.owedTrailingIdles > 0) {
-                      session.owedTrailingIdles--;
-                    }
-                    settleDeferredIfDrained();
-                  } else if (session.owedTrailingIdles > 0) {
-                    // Absorb a settled turn's trailing idle. Also covers a
-                    // cancel that landed between a turn's counted result and
-                    // this lagged idle (no active turn to settle): the idle
-                    // still belongs to that settled turn, and skipping the
-                    // decrement would leak the debt permanently.
-                    session.owedTrailingIdles--;
+                    settleActive({ stopReason: "cancelled" });
+                  } else if (owedTrailingIdles > 0) {
+                    owedTrailingIdles--;
+                  } else if (settleBackgroundIdleWaiters()) {
+                    // The idle was consumed as the drain marker for a deferred
+                    // background-task completion.
                   } else if (
                     !session.cancelled &&
                     session.activeTurn &&
-                    !session.activeTurn.settled
+                    !session.activeTurn.settled &&
+                    !session.activeTurn.pendingCompletion
                   ) {
-                    // Deliberately only the ACTIVE turn: a queued turn that
-                    // was never echoed is NOT failed here, because an idle
-                    // can legitimately precede the SDK picking up freshly
-                    // pushed input (the idle was emitted before the SDK read
-                    // it) — failing the queue head on that race would reject
-                    // a prompt the SDK is about to run. A turn abandoned
-                    // before its echo therefore still hangs until cancel or
-                    // the next prompt; only a timer could tell those apart.
                     this.logger.error(
                       `Session ${params.sessionId}: SDK went idle without emitting a result ` +
                         `for the active turn; failing the in-flight prompt (issue #825)`,
@@ -2558,7 +1737,7 @@ export class ClaudeAcpAgent {
                 const title = isSynthesis
                   ? "Recalled synthesized memory"
                   : `Recalled ${count} ${count === 1 ? "memory" : "memories"}`;
-                await sendUpdate({
+                await this.client.sessionUpdate({
                   sessionId: message.session_id,
                   update: {
                     sessionUpdate: "tool_call",
@@ -2585,7 +1764,7 @@ export class ClaudeAcpAgent {
                 // list with this payload: supportedCommands() is captured once
                 // at initialize and never reflects mid-session changes, so we
                 // forward message.commands directly rather than re-querying.
-                await sendUpdate({
+                await this.client.sessionUpdate({
                   sessionId: message.session_id,
                   update: {
                     sessionUpdate: "available_commands_update",
@@ -2611,7 +1790,7 @@ export class ClaudeAcpAgent {
                 // rejection reason — otherwise the client shows a tool call
                 // that silently never resolves.
                 const reason = message.decision_reason ?? message.message;
-                await sendUpdate({
+                await this.client.sessionUpdate({
                   sessionId: message.session_id,
                   update: {
                     sessionUpdate: "tool_call_update",
@@ -2643,15 +1822,11 @@ export class ClaudeAcpAgent {
                 // instead of a silent stop. ACP's agent_message_chunk has no
                 // severity field, so fold the level into the text for the more
                 // prominent levels ('info' is transcript-only noise — leave plain).
-                // Sending via sendUpdate also marks the notice as this stretch's
-                // delivered text: a hook-blocked turn's result repeats the block
-                // reason with zero output tokens, and the issue-#453 fallback
-                // must not emit it a second time.
                 const text =
                   message.level === "info"
                     ? message.content
                     : `**${message.level[0].toUpperCase()}${message.level.slice(1)}:** ${message.content}`;
-                await sendUpdate({
+                await this.client.sessionUpdate({
                   sessionId: message.session_id,
                   update: {
                     sessionUpdate: "agent_message_chunk",
@@ -2665,56 +1840,25 @@ export class ClaudeAcpAgent {
               case "hook_response":
               case "files_persisted":
                 break;
-              case "task_progress":
-                await emitTaskLifecycle(message);
-                break;
               case "task_started":
                 await emitTaskLifecycle(message);
-                // For subagent tasks `task_id` is the subagent's agent id (the
-                // SDK keys its task registry by agent id) and `tool_use_id` is
-                // the Agent/Task tool_use that spawned it — recorded so the
-                // subagent's permission requests, which reach canUseTool with
-                // only `agentID`, can attribute their eagerly-emitted
-                // tool_call to the parent tool call. Non-subagent tasks (e.g.
-                // background Bash) land here too; their task_ids never match
-                // an agentID, so those entries are inert for attribution.
-                //
-                // `isSubagent` marks Task/Agent-tool subagents — the tasks
-                // whose completion wakes the model for a followup, so the
-                // ones worth deferring turn settlement for. A sync subagent
-                // is pruned (terminal task_updated) before its turn's result
-                // can arrive, so registry membership at result time means an
-                // async subagent. Their spawn is also recorded on the active
-                // turn: a turn only ever waits on its own subagents, and a
-                // spawn during a held-open drain window (an agent chain)
-                // extends that turn's hold.
-                session.liveBackgroundTasks.set(message.task_id, {
-                  parentToolUseId: message.tool_use_id,
-                  isSubagent: !!message.subagent_type,
-                });
-                if (message.subagent_type && session.activeTurn && !session.activeTurn.settled) {
-                  (session.activeTurn.spawnedTaskIds ??= new Set()).add(message.task_id);
-                }
+                trackBackgroundTask(message.task_id, { skipTranscript: message.skip_transcript });
                 break;
               case "task_notification":
                 await emitTaskLifecycle(message);
-                // The task settled — no further tool calls can originate
-                // from it, so its registry entry can be dropped.
-                session.liveBackgroundTasks.delete(message.task_id);
+                finishBackgroundTask(message.task_id);
+                break;
+              case "task_progress":
+                await emitTaskLifecycle(message);
                 break;
               case "task_updated":
                 await emitTaskLifecycle(message);
-                // terminal-status task_updated patch and a (deduplicated)
-                // task_notification when a task settles, but only the patch is
-                // guaranteed per transition — prune on it too so the registry
-                // can't grow for the session's lifetime if a notification is
-                // skipped.
                 if (
                   message.patch.status === "completed" ||
                   message.patch.status === "failed" ||
                   message.patch.status === "killed"
                 ) {
-                  session.liveBackgroundTasks.delete(message.task_id);
+                  finishBackgroundTask(message.task_id);
                 }
                 break;
               case "worker_shutting_down":
@@ -2766,7 +1910,7 @@ export class ClaudeAcpAgent {
                 const outcome = persistent
                   ? `The session will continue on ${message.fallback_model}.`
                   : `The session stays on ${message.original_model}.`;
-                await sendUpdate({
+                await this.client.sessionUpdate({
                   sessionId: message.session_id,
                   update: {
                     sessionUpdate: "agent_message_chunk",
@@ -2804,400 +1948,249 @@ export class ClaudeAcpAgent {
                   lastRefusalExplanation = message.api_refusal_explanation ?? message.content;
                 }
                 break;
-              // `control_request_progress` only reports on side_question
-              // control requests, which this adapter never issues.
-              case "control_request_progress":
-                break;
-              case "background_tasks_changed":
-                // A level signal: the full live background-task set on every
-                // membership change, with REPLACE semantics. Used only to
-                // reconcile `liveBackgroundTasks` — dropping (or, for
-                // subagent entries, unpinning) any entry whose settle
-                // bookend (task_notification / terminal task_updated) was
-                // lost, so a leaked subagent entry can't defer its spawning
-                // turn's settlement forever. Growth of retained
-                // (endedPerLevel) subagent entries is bounded by the
-                // activation-time sweep in activateTurn, not here. It never
-                // ADDS entries (the payload carries no attribution or
-                // subagent marker), so the unspecified ordering vs. the edge
-                // bookends is safe: a level that precedes its task_started
-                // simply no-ops here.
-                if (session.liveBackgroundTasks.size > 0) {
-                  const live = new Set(message.tasks.map((t) => t.task_id));
-                  for (const [taskId, record] of session.liveBackgroundTasks) {
-                    if (live.has(taskId)) {
-                      // The level proves the task live in the background
-                      // universe (e.g. a foreground agent was backgrounded
-                      // after an earlier absent-marking, or that marking was
-                      // a racing payload built before the task registered) —
-                      // un-end it so a hold waits on it again, and disarm
-                      // the activation sweep.
-                      record.endedPerLevel = undefined;
-                      continue;
-                    }
-                    if (record.isSubagent) {
-                      // The level's universe is BACKGROUND tasks only, so a
-                      // live sync (foreground) subagent is legitimately
-                      // absent — deleting its entry would strand its
-                      // permission attribution (#859). Keep the entry but
-                      // stop any hold from waiting on the id: an absent id
-                      // can equally be a leaked async entry whose settle
-                      // bookends were lost.
-                      record.endedPerLevel ??= "ended";
-                    } else {
-                      session.liveBackgroundTasks.delete(taskId);
-                    }
-                  }
-                }
-                break;
               default:
                 unreachable(message, this.logger);
                 break;
             }
             break;
           case "result": {
-            // A result from an autonomous cycle — a task-notification
-            // followup, or a peer/coordinator/observer message the model
-            // handled on its own (see AUTONOMOUS_RESULT_ORIGINS) — is not
-            // the user's prompt's. Autonomous results must never touch the
-            // user-turn lifecycle (stop reason, settles, failActive,
-            // slash-command output forwarding), though their cost is real.
-            const isAutonomousResult =
-              message.origin != null && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind);
+            // Task-notification followups are autonomous work triggered by a
+            // task-notification system message, not by the user's prompt.
+            // They should not influence the user-turn lifecycle (stop reason,
+            // slash-command output forwarding) but their cost is real.
+            const isTaskNotification = message.origin?.kind === "task-notification";
 
-            try {
-              // Reconcile the Fast mode toggle with the SDK's reported state.
-              // Gated to user-driven turns like every other side effect below;
-              // an autonomous cycle's state lands on the next user turn's
-              // result. Runs even when the turn errors or was cancelled.
-              if (!isAutonomousResult) {
-                await this.syncFastModeState(params.sessionId, session, message.fast_mode_state);
+            // Reconcile the Fast mode toggle with the SDK's reported state.
+            // Gated to user-driven turns like every other side effect below; a
+            // background followup's state lands on the next user turn's result.
+            // Runs even when the turn errors or was cancelled.
+            if (!isTaskNotification) {
+              await this.syncFastModeState(params.sessionId, session, message.fast_mode_state);
+            }
+
+            // A user-turn result needs an active turn so its stop reason is
+            // attributed and the turn settles at idle. Local-only commands carry
+            // no user-message echo to promote them, so do it here from the head.
+            // Promote BEFORE accumulating usage, since activation resets the
+            // accumulator — promoting after would discard this result's tokens.
+            if (!isTaskNotification) {
+              await ensureActiveTurn();
+            }
+
+            // Every user-turn result terminates a turn (settle, reject, or
+            // orphan skip) and the SDK follows it with a trailing
+            // `session_state_changed: idle` — record the debt so the idle
+            // handler absorbs that idle rather than reading it as a turn the
+            // SDK abandoned (issue #825). One exclusion: the cancelled ACTIVE
+            // turn's own result. It is dropped at the `session.cancelled`
+            // guard, and either the idle itself settles the turn (consuming
+            // the trailer) or the next echo's hand-off does (which records
+            // the debt there instead) — counting here too would double it.
+            // Results skipped while cancelled with NO active turn — orphaned
+            // queued turns the SDK still ran, or a force-cancelled turn's
+            // late result after the backstop settled it — get no such settle,
+            // so their trailers must be counted here or they'd later be read
+            // as the next healthy turn being abandoned and false-fail it.
+            if (!isTaskNotification && (!session.cancelled || !session.activeTurn)) {
+              owedTrailingIdles++;
+            }
+
+            // Accumulate usage into the user turn's tally. Skip task-notification
+            // followups: their cost is real but is reported separately via the
+            // usage_update below, and `session.accumulatedUsage` is only reset on
+            // turn activation — so folding a task-notification result that lands
+            // after the next turn is active (but before it settles) would leak
+            // those tokens into that turn's PromptResponse.usage.
+            if (!isTaskNotification) {
+              session.accumulatedUsage.inputTokens += message.usage.input_tokens;
+              session.accumulatedUsage.outputTokens += message.usage.output_tokens;
+              session.accumulatedUsage.cachedReadTokens += message.usage.cache_read_input_tokens;
+              session.accumulatedUsage.cachedWriteTokens +=
+                message.usage.cache_creation_input_tokens;
+            }
+
+            const matchingModelUsage = lastAssistantModel
+              ? getMatchingModelUsage(message.modelUsage, lastAssistantModel)
+              : null;
+            // Only overwrite when we have an authoritative value — a miss
+            // (e.g. a turn with no top-level assistant message) would
+            // otherwise discard the window learned on a prior turn and
+            // leave the next prompt's mid-stream updates reporting 200k.
+            if (matchingModelUsage) {
+              session.contextWindowSize = matchingModelUsage.contextWindow;
+            }
+
+            // Send usage_update notification
+            if (lastAssistantTotalUsage !== null) {
+              await this.client.sessionUpdate({
+                sessionId: params.sessionId,
+                update: {
+                  sessionUpdate: "usage_update",
+                  used: lastAssistantTotalUsage,
+                  size: session.contextWindowSize,
+                  cost: {
+                    amount: message.total_cost_usd,
+                    currency: "USD",
+                  },
+                  ...(message.origin && {
+                    _meta: { "_claude/origin": message.origin },
+                  }),
+                },
+              });
+            }
+
+            if (session.cancelled) {
+              if (!isTaskNotification) {
+                stopReason = "cancelled";
               }
+              break;
+            }
 
-              // A user-turn result needs an active turn so its stop reason is
-              // attributed and the turn settles at idle. Local-only commands carry
-              // no user-message echo to promote them, so do it here from the head.
-              // Promote BEFORE accumulating usage, since activation resets the
-              // accumulator — promoting after would discard this result's tokens.
-              // The orphan bookkeeping runs first: it covers folded/zombie
-              // commands whose shared or late result this is, even when the
-              // result is the ACTIVE turn's (ensureActiveTurn never looks at
-              // the map in that case).
-              if (!isAutonomousResult) {
-                recordResultForOrphanCommands();
-                await ensureActiveTurn();
+            const extNotification = this.client.extNotification?.bind(this.client);
+            if (extNotification) {
+              const modelUsage: Record<string, ModelUsageExt> = {};
+              for (const [model, usage] of Object.entries(message.modelUsage)) {
+                modelUsage[model] = {
+                  inputTokens: usage.inputTokens,
+                  outputTokens: usage.outputTokens,
+                  cacheReadInputTokens: usage.cacheReadInputTokens,
+                  cacheCreationInputTokens: usage.cacheCreationInputTokens,
+                  webSearchRequests: usage.webSearchRequests,
+                  costUSD: usage.costUSD,
+                };
               }
-
-              // A result closes the stretch of output it terminates: snapshot
-              // the delivery record — AFTER ensureActiveTurn, whose held-turn
-              // hand-off closes the held stretch, so an echo-less command
-              // promoted here is judged on its own delivery, not on the held
-              // turn's followup text — and before the handling below can emit
-              // anything of its own; the `finally` then clears it so every
-              // exit from this case (the cancelled-guard and refusal breaks
-              // included) starts the next stretch clean. Clearing up front
-              // instead would let result-time emissions (refusal explanation,
-              // result-text forwarding) taint the next stretch and suppress a
-              // following replayed turn's fallback. Autonomous cycles run
-              // alongside a user turn and must not clear its flag (they exit
-              // through the early break below, which the gated `finally`
-              // leaves alone).
-              const deliveredAssistantText = session.emittedAssistantText;
-
-              // Every user-turn result terminates a turn (settle, reject, or
-              // orphan skip) and the SDK follows it with a trailing
-              // `session_state_changed: idle` — record the debt so the idle
-              // handler absorbs that idle rather than reading it as a turn the
-              // SDK abandoned (issue #825). One exclusion: the cancelled ACTIVE
-              // turn's own result. It is dropped at the `session.cancelled`
-              // guard, and either the idle itself settles the turn (consuming
-              // the trailer) or the next echo's hand-off does (which records
-              // the debt there instead) — counting here too would double it.
-              // Results skipped while cancelled with NO active turn — orphaned
-              // queued turns the SDK still ran, or a force-cancelled turn's
-              // late result after the backstop settled it — get no such settle,
-              // so their trailers must be counted here or they'd later be read
-              // as the next healthy turn being abandoned and false-fail it.
-              // Autonomous results (followups, peer/channel/coordinator
-              // cycles) are counted too: each is its own processing cycle with
-              // its own trailing idle, and that idle can lag past the next
-              // prompt's echo — which, un-owed, would be read as the fresh
-              // turn being abandoned (#825 false-fail). That lag was mostly
-              // unreachable when such cycles only ran with no pending turn,
-              // but a held turn settling AT a followup result unblocks the
-              // client at exactly that point, making the race the common
-              // case.
-              // The cancelled-ACTIVE-turn exclusion applies only to that
-              // turn's OWN result — a followup result arriving inside the
-              // cancel window still gets its own trailer and must be counted,
-              // or that idle would later false-fail the next prompt.
-              if (isAutonomousResult || !session.cancelled || !session.activeTurn) {
-                session.owedTrailingIdles++;
+              const usages: SessionUsageUpdate = {
+                usage: {
+                  inputTokens: message.usage.input_tokens,
+                  outputTokens: message.usage.output_tokens,
+                  cacheCreationInputTokens: message.usage.cache_creation_input_tokens,
+                  cacheReadInputTokens: message.usage.cache_read_input_tokens,
+                },
+                modelUsage,
+              };
+              await extNotification(
+                EXT_METHOD_NAME.usage_update,
+                usages as unknown as Record<string, unknown>,
+              );
+              const limits = await getUsage();
+              if (limits && !limits.apiUnavailable) {
+                await extNotification(
+                  EXT_METHOD_NAME.rate_limits,
+                  limits as unknown as Record<string, unknown>,
+                );
               }
+            }
 
-              // Accumulate usage into the user turn's tally. Skip autonomous
-              // results: their cost is real but is reported separately via the
-              // usage_update below, and `session.accumulatedUsage` is only reset on
-              // turn activation — so folding an autonomous result that lands
-              // after the next turn is active (but before it settles) would leak
-              // those tokens into that turn's PromptResponse.usage.
-              if (!isAutonomousResult) {
-                session.accumulatedUsage.inputTokens += message.usage.input_tokens;
-                session.accumulatedUsage.outputTokens += message.usage.output_tokens;
-                session.accumulatedUsage.cachedReadTokens += message.usage.cache_read_input_tokens;
-                session.accumulatedUsage.cachedWriteTokens +=
-                  message.usage.cache_creation_input_tokens;
-              }
-
-              const matchingModelUsage = lastAssistantModel
-                ? getMatchingModelUsage(message.modelUsage, lastAssistantModel)
-                : null;
-              // Only overwrite when we have an authoritative value — a miss
-              // (e.g. a turn with no top-level assistant message) would
-              // otherwise discard the window learned on a prior turn and
-              // leave the next prompt's mid-stream updates reporting 200k.
-              if (matchingModelUsage) {
-                session.contextWindowSize = matchingModelUsage.contextWindow;
-              }
-
-              // Send usage_update notification
-              if (lastAssistantTotalUsage !== null) {
-                await sendUpdate({
+            // A refusal can arrive on any result subtype (and may even set
+            // is_error), so handle it before the subtype switch — otherwise the
+            // is_error throw below would surface it as an internal error. The
+            // refused assistant message carries no visible content, so surface
+            // the classifier's explanation (when available) and report ACP's
+            // dedicated `refusal` stop reason.
+            if (message.stop_reason === "refusal" && !isTaskNotification) {
+              if (lastRefusalExplanation) {
+                await this.client.sessionUpdate({
                   sessionId: params.sessionId,
                   update: {
-                    sessionUpdate: "usage_update",
-                    used: lastAssistantTotalUsage,
-                    size: session.contextWindowSize,
-                    cost: {
-                      amount: message.total_cost_usd,
-                      currency: "USD",
-                    },
-                    ...(message.origin && {
-                      _meta: { "_claude/origin": message.origin },
-                    }),
+                    sessionUpdate: "agent_message_chunk",
+                    content: { type: "text", text: lastRefusalExplanation },
                   },
                 });
               }
+              stopReason = "refusal";
+              deferActiveUntilBackgroundDrain({
+                stopReason: "refusal",
+                usage: sessionUsage(session),
+              });
+              break;
+            }
 
-              if (session.cancelled) {
-                if (!isAutonomousResult) {
-                  stopReason = "cancelled";
+            switch (message.subtype) {
+              case "success": {
+                if (message.result.includes("Please run /login")) {
+                  failActive(RequestError.authRequired());
+                  break;
                 }
-                break;
-              }
-
-              const extNotification = this.client.extNotification?.bind(this.client);
-              if (extNotification) {
-                const modelUsage: Record<string, ModelUsageExt> = {};
-                for (const [model, usage] of Object.entries(message.modelUsage)) {
-                  modelUsage[model] = {
-                    inputTokens: usage.inputTokens,
-                    outputTokens: usage.outputTokens,
-                    cacheReadInputTokens: usage.cacheReadInputTokens,
-                    cacheCreationInputTokens: usage.cacheCreationInputTokens,
-                    webSearchRequests: usage.webSearchRequests,
-                    costUSD: usage.costUSD,
-                  };
+                if (message.stop_reason === "max_tokens") {
+                  if (!isTaskNotification) {
+                    stopReason = "max_tokens";
+                  }
+                  break;
                 }
-                const usages: SessionUsageUpdate = {
-                  usage: {
-                    inputTokens: message.usage.input_tokens,
-                    outputTokens: message.usage.output_tokens,
-                    cacheCreationInputTokens: message.usage.cache_creation_input_tokens,
-                    cacheReadInputTokens: message.usage.cache_read_input_tokens,
-                  },
-                  modelUsage,
-                };
-                await extNotification(
-                  EXT_METHOD_NAME.usage_update,
-                  usages as unknown as Record<string, unknown>,
-                );
-                const limits = await getUsage();
-                if (limits && !limits.apiUnavailable) {
-                  await extNotification(
-                    EXT_METHOD_NAME.rate_limits,
-                    limits as unknown as Record<string, unknown>,
+                if (message.is_error) {
+                  failActive(
+                    RequestError.internalError(errorKindData(lastAssistantError), message.result),
                   );
+                  break;
                 }
-              }
-
-              // A held turn (see Turn.deferredSettle) settles at its
-              // followup's terminal result: this is the earliest point at which
-              // the promised summary has fully streamed — the trailing idle
-              // would work too, but a client should not wait out another idle
-              // round-trip for a response whose content is already complete.
-              // (While the turn still awaits another of its subagents —
-              // parallel spawns — the helper holds; the next notification's
-              // followup settles it instead. Other autonomous origins — peer/
-              // channel/coordinator cycles — reach here too: settling a
-              // drained hold at their results is as good as the idle
-              // fallback.) Then stop: everything below is user-turn
-              // lifecycle, and an autonomous outcome must never touch it —
-              // its is_error or "Please run /login" text would otherwise
-              // failActive a live turn (the held one, or the user's next
-              // prompt) whose own result recorded a different outcome.
-              if (isAutonomousResult) {
-                settleDeferredIfDrained();
-                // With no turn in flight OR QUEUED (also after the settle
-                // above), the stretch holds only autonomous prose — close
-                // it, so a replayed next prompt isn't silently suppressed by
-                // the issue-#453 delivery check. A live turn's flag may
-                // guard the USER's already-streamed text — and so may a
-                // QUEUED turn's: with mid-message echo lag its deltas stream
-                // before the echo activates it (activeTurn still null), and
-                // clearing then would re-emit that answer via the fallback,
-                // the duplicate direction the flag's doc forbids.
-                if (!session.activeTurn && !firstUnsettledQueuedTurn()) {
-                  session.emittedAssistantText = false;
-                }
-                break;
-              }
-
-              // A refusal can arrive on any result subtype (and may even set
-              // is_error), so handle it before the subtype switch — otherwise the
-              // is_error throw below would surface it as an internal error. The
-              // refused assistant message carries no visible content, so surface
-              // the classifier's explanation (when available) and report ACP's
-              // dedicated `refusal` stop reason.
-              if (message.stop_reason === "refusal") {
-                if (lastRefusalExplanation) {
-                  await sendUpdate({
-                    sessionId: params.sessionId,
-                    update: {
-                      sessionUpdate: "agent_message_chunk",
-                      content: { type: "text", text: lastRefusalExplanation },
-                    },
-                  });
-                }
-                stopReason = "refusal";
-                // Through the deferral gate, not settleActive: a refusal can
-                // land on a turn whose spawned subagents are still live, and
-                // settling it out from under them would strand their output
-                // and permission requests out-of-turn (issue #866's deadlock,
-                // through the refusal lane).
-                settleOrDefer({ stopReason: "refusal", usage: sessionUsage(session) });
-                break;
-              }
-
-              switch (message.subtype) {
-                case "success": {
-                  if (message.result.includes("Please run /login")) {
-                    failActive(RequestError.authRequired());
-                    break;
+                // For local-only commands (no model invocation), the result
+                // text is the command output — forward it to the client.
+                // Task-notification followups never originate from a user
+                // slash command, so skip the forwarding for them.
+                if (session.activeTurn?.isLocalOnlyCommand && !isTaskNotification) {
+                  for (const notification of toAcpNotifications(
+                    message.result,
+                    "assistant",
+                    params.sessionId,
+                    session.toolUseCache,
+                    this.client,
+                    this.logger,
+                  )) {
+                    await this.client.sessionUpdate(notification);
                   }
-                  if (message.stop_reason === "max_tokens") {
+                }
+                break;
+              }
+              case "error_during_execution": {
+                if (message.stop_reason === "max_tokens") {
+                  if (!isTaskNotification) {
                     stopReason = "max_tokens";
-                    break;
-                  }
-                  if (message.is_error) {
-                    failActive(
-                      RequestError.internalError(errorKindData(lastAssistantError), message.result),
-                    );
-                    break;
-                  }
-                  // The result text is forwarded in two cases. Local-only
-                  // commands (no model invocation): the result IS the command
-                  // output. Otherwise the result is normally a trailing copy of
-                  // text that already streamed — but a cache-replayed turn
-                  // generates no tokens, and some CLIs then skip streaming
-                  // entirely and answer on the `result` alone: no `stream_event`
-                  // deltas, no consolidated `assistant` message (issue #453).
-                  // Forward it rather than end the turn silently:
-                  // `deliveredAssistantText` covers whatever already reached the
-                  // client (a turn that showed its answer cannot emit it twice),
-                  // and the output-token check keeps the fallback to the
-                  // replayed turns it was reported for. `?? 0`: typed non-null,
-                  // but third-party backends have been observed omitting usage
-                  // token fields (see snapshotFromUsage), and the replay lane
-                  // was reported from exactly such a backend — treat a missing
-                  // count as the replay signature rather than silently disabling
-                  // the fallback there. (Autonomous results never get here —
-                  // they exit at the early break above — so no background
-                  // prose can be injected into the feed.)
-                  if (
-                    session.activeTurn?.isLocalOnlyCommand ||
-                    (!deliveredAssistantText && (message.usage.output_tokens ?? 0) === 0)
-                  ) {
-                    for (const notification of toAcpNotifications(
-                      message.result,
-                      "assistant",
-                      params.sessionId,
-                      session.toolUseCache,
-                      this.client,
-                      this.logger,
-                    )) {
-                      await sendUpdate(notification);
-                    }
                   }
                   break;
                 }
-                case "error_during_execution": {
-                  if (message.stop_reason === "max_tokens") {
-                    stopReason = "max_tokens";
-                    break;
-                  }
-                  if (message.is_error) {
-                    failActive(
-                      RequestError.internalError(
-                        errorKindData(lastAssistantError),
-                        message.errors.join(", ") || message.subtype,
-                      ),
-                    );
-                    break;
-                  }
+                if (message.is_error) {
+                  failActive(
+                    RequestError.internalError(
+                      errorKindData(lastAssistantError),
+                      message.errors.join(", ") || message.subtype,
+                    ),
+                  );
+                  break;
+                }
+                if (!isTaskNotification) {
                   stopReason = "end_turn";
+                }
+                break;
+              }
+              case "error_max_budget_usd":
+              case "error_max_turns":
+              case "error_max_structured_output_retries":
+                if (message.is_error) {
+                  failActive(
+                    RequestError.internalError(
+                      errorKindData(lastAssistantError),
+                      message.errors.join(", ") || message.subtype,
+                    ),
+                  );
                   break;
                 }
-                case "error_max_budget_usd":
-                case "error_max_turns":
-                case "error_max_structured_output_retries":
-                  if (message.is_error) {
-                    failActive(
-                      RequestError.internalError(
-                        errorKindData(lastAssistantError),
-                        message.errors.join(", ") || message.subtype,
-                      ),
-                    );
-                    break;
-                  }
+                if (!isTaskNotification) {
                   stopReason = "max_turn_requests";
-                  break;
-                default:
-                  unreachable(message, this.logger);
-                  break;
-              }
-              // Settle the user turn at its terminal result so the client unlocks
-              // as soon as the answer is done, rather than waiting for the SDK's
-              // trailing `idle` (which can lag while background work runs — issue
-              // #773). The consumer keeps draining afterward (absorbing idle and
-              // forwarding any background output).
-              //
-              // One exception: while background subagents this turn spawned are
-              // still live, settling now would strand their remaining work
-              // outside any turn — ACP allows out-of-turn session/update, but
-              // many clients stop consuming at the prompt response, and a
-              // subagent's permission request would block on an RPC nobody
-              // answers (issues #864/#866). Hold the turn open instead: store
-              // the outcome and settle with it once the subagents are done —
-              // at their followup's terminal result (see the deferred-settle
-              // block above the subtype switch) or at an idle with none of
-              // them left — so the subagents' streamed output, their
-              // permission requests, and the model's promised summary all land
-              // inside the turn. `session/cancel` and the next prompt's echo
-              // hand-off still settle a deferred turn early, so a long-running
-              // subagent never holds the prompt hostage.
-              //
-              // is_error/auth already settled via failActive (activeTurn is null
-              // then, so both branches no-op); cancellation is left to the
-              // idle/abort path. settleActive is idempotent, so a duplicate
-              // idle is a no-op.
-              if (!session.cancelled) {
-                settleOrDefer({ stopReason, usage: sessionUsage(session) });
-              }
-            } finally {
-              if (!isAutonomousResult) {
-                session.emittedAssistantText = false;
-              }
+                }
+                break;
+              default:
+                unreachable(message, this.logger);
+                break;
+            }
+            // Settle ordinary user turns at their terminal result so the client
+            // unlocks without waiting for a lagging trailing `idle` (issue
+            // #773). If this turn started background SDK tasks that are still
+            // running, hold the response until those tasks complete and the SDK
+            // emits a follow-up `idle` drain marker. is_error/auth already
+            // settled via failActive; cancellation is left to the idle/abort
+            // path.
+            if (!isTaskNotification && !session.cancelled) {
+              deferActiveUntilBackgroundDrain({ stopReason, usage: sessionUsage(session) });
             }
             break;
           }
@@ -3245,7 +2238,7 @@ export class ClaudeAcpAgent {
               // create a block the consolidated handler's `text.length > 0`
               // guard can never consume, stalling the diff cursor and
               // re-emitting the next block as a duplicate.
-              if (chunk?.text) {
+              if (chunk && chunk.text.length > 0) {
                 const index = message.event.index;
                 const last = streamedBlocks[streamedBlocks.length - 1];
                 if (last && last.index === index && last.type === chunk.type) {
@@ -3264,10 +2257,11 @@ export class ClaudeAcpAgent {
                 const model = message.event.message.model;
                 if (model && model !== "<synthetic>") {
                   lastAssistantModel = model;
-                  // Only upgrade from the default — once the SDK has given us
-                  // an authoritative window (seeded at session creation,
-                  // refreshed on model switches in `applyConfigOptionValue`,
-                  // confirmed by each `result`), trust it over the heuristic.
+                  // Only upgrade from the default — once a `result` has given
+                  // us an authoritative window, trust it over the heuristic.
+                  // Model switches invalidate the cached window via
+                  // `syncSessionConfigState`, which resets us back to the
+                  // default so this branch runs again for the new model.
                   if (session.contextWindowSize === DEFAULT_CONTEXT_WINDOW) {
                     const inferred = inferContextWindowFromModel(model);
                     if (inferred !== null) {
@@ -3295,7 +2289,7 @@ export class ClaudeAcpAgent {
               const nextUsage = totalTokens(lastAssistantUsage);
               if (nextUsage !== lastAssistantTotalUsage) {
                 lastAssistantTotalUsage = nextUsage;
-                await sendUpdate({
+                await this.client.sessionUpdate({
                   sessionId: params.sessionId,
                   update: {
                     sessionUpdate: "usage_update",
@@ -3317,12 +2311,9 @@ export class ClaudeAcpAgent {
                 taskState: session.taskState,
                 emittedToolCalls: session.emittedToolCalls,
                 messageId: currentStreamMessageId,
-                streamedToolInputs,
               },
             )) {
-              // sendUpdate records delivery; a subagent stream's chunks carry
-              // the stamped parentToolUseId meta and are excluded there.
-              await sendUpdate(notification);
+              await this.client.sessionUpdate(notification);
             }
             break;
           }
@@ -3344,7 +2335,9 @@ export class ClaudeAcpAgent {
             // is still promoted — activateTurn() clears the flag. The turn's own
             // echo is then dropped from the feed (the client already shows it).
             if (message.type === "user" && "uuid" in message && message.uuid) {
-              const queued = findUnsettledTurn(message.uuid);
+              const queued = (session.turnQueue ?? []).find(
+                (t) => t.promptUuid === message.uuid && !t.settled,
+              );
               if (queued) {
                 // Only (re)activate if this isn't already the active turn — a
                 // turn promoted early (e.g. by a result that preceded its echo)
@@ -3356,42 +2349,33 @@ export class ClaudeAcpAgent {
                     // "cancelled" per the ACP contract rather than "end_turn" —
                     // otherwise a cancel followed quickly by the next prompt
                     // would report the cancelled turn as a normal completion.
+                    const previous = session.activeTurn;
                     if (session.cancelled) {
                       // The cancelled turn settles here, but the trailing idle
                       // its interrupt produces is still in flight — record the
                       // debt so that lagged idle is absorbed rather than read
                       // as the freshly-activated turn ending without a result
                       // (which would false-fail a healthy turn — issue #825).
-                      // Counted for a DEFERRED turn too, even though its own
-                      // result already recorded a debt that may still be
-                      // outstanding: the interrupt can produce a trailer of
-                      // its own, and over-counting is benign (absorbs one
-                      // future idle) while under-counting risks the false
-                      // fail this debt exists to prevent.
-                      session.owedTrailingIdles++;
-                      // Before activateTurn resets the accumulator, so the
-                      // usage still belongs to the cancelled turn.
-                      settleActive({ stopReason: "cancelled", usage: sessionUsage(session) });
-                    } else if (isHeldOpen(session.activeTurn)) {
-                      // A turn held open for its background subagents (see
-                      // Turn.deferredSettle) hands off with the real outcome
-                      // its result recorded, not a guessed end_turn — the
-                      // user moving on must not block behind a long-running
-                      // subagent, but it must not rewrite the stop reason
-                      // either. Its trailing-idle debt stands and is absorbed
-                      // when the drain idle eventually arrives.
-                      settleActive(session.activeTurn.deferredSettle);
+                      owedTrailingIdles++;
+                      settleTurn(previous, { stopReason: "cancelled" });
+                    } else if (
+                      previous.pendingCompletion ||
+                      previous.pendingTaskIds.size > 0 ||
+                      previous.startedBackgroundTask
+                    ) {
+                      previous.pendingCompletion ??= {
+                        stopReason: "end_turn",
+                        usage: sessionUsage(session),
+                      };
+                      previous.waitForBackgroundIdle = true;
+                      session.activeTurn = null;
                     } else {
-                      settleActive({ stopReason: "end_turn", usage: sessionUsage(session) });
+                      settleTurn(previous, {
+                        stopReason: "end_turn",
+                        usage: sessionUsage(session),
+                      });
                     }
                   }
-                  // Unlike the no-result teardown lanes, this hand-off must
-                  // NOT clear emittedAssistantText for a NON-held previous
-                  // turn (a held one's settleActive above closes its own
-                  // stretch): the echo can land
-                  // mid-message, so deltas already streamed belong to the turn
-                  // being activated — clearing would forget them and let its
-                  // result re-emit the answer.
                   await activateTurn(queued);
                 }
                 break;
@@ -3457,7 +2441,7 @@ export class ClaudeAcpAgent {
                     messageId: messageIdForGrouping(message),
                   },
                 )) {
-                  await sendUpdate(notification);
+                  await this.client.sessionUpdate(notification);
                 }
               } else {
                 this.logger.log(message.message.content);
@@ -3486,7 +2470,14 @@ export class ClaudeAcpAgent {
               break;
             }
 
-            if (message.type === "assistant" && isSyntheticLoginMessage(message.message)) {
+            if (
+              message.type === "assistant" &&
+              message.message.model === "<synthetic>" &&
+              Array.isArray(message.message.content) &&
+              message.message.content.length === 1 &&
+              message.message.content[0].type === "text" &&
+              message.message.content[0].text.includes("Please run /login")
+            ) {
               failActive(RequestError.authRequired());
               break;
             }
@@ -3579,19 +2570,14 @@ export class ClaudeAcpAgent {
                 taskState: session.taskState,
                 emittedToolCalls: session.emittedToolCalls,
                 messageId: messageIdForGrouping(message),
-                toolUseResult: message.type === "user" ? message.tool_use_result : undefined,
               },
             )) {
-              // sendUpdate records delivery. Subagent text/thinking is
-              // filtered out of `content` above; blocks that do pass through
-              // (e.g. a subagent image) carry the stamped parentToolUseId
-              // meta and are excluded there.
-              await sendUpdate(notification);
+              await this.client.sessionUpdate(notification);
             }
             break;
           }
           case "tool_progress": {
-            await sendUpdate({
+            await this.client.sessionUpdate({
               sessionId: message.session_id,
               update: {
                 sessionUpdate: "tool_call_update",
@@ -3609,7 +2595,7 @@ export class ClaudeAcpAgent {
           }
           case "rate_limit_event": {
             if (lastAssistantTotalUsage !== null) {
-              await sendUpdate({
+              await this.client.sessionUpdate({
                 sessionId: message.session_id,
                 update: {
                   sessionUpdate: "usage_update",
@@ -3624,13 +2610,16 @@ export class ClaudeAcpAgent {
           // `conversation_reset` (from `/clear`, plan-mode exit, fresh-session
           // flows) is safe to drop: turn lifecycle here is driven by
           // results/idle, and the client owns its own transcript view.
+          // `control_request_progress` only reports on side_question control
+          // requests, which this adapter never issues.
           case "tool_use_summary":
           case "auth_status":
           case "prompt_suggestion":
           case "conversation_reset":
+          case "control_request_progress":
             break;
           default:
-            unreachable(message, this.logger);
+            unreachable(message);
             break;
         }
       }
@@ -3672,34 +2661,6 @@ export class ClaudeAcpAgent {
     }
   }
 
-  /** Route one orphaned command into the session's orphan-accounting lane:
-   *  the per-uuid map on msg_lifecycle_v1 CLIs (drained by the command's own
-   *  terminal lifecycle frame and the echo-less-result skip), the plain count
-   *  elsewhere (the count lane can't express per-command states, so `state`
-   *  only matters on the map lane). Both orphan-producing paths — cancel()'s
-   *  queued-turn sweep and the consumer's force-cancel wedge path — must seed
-   *  through here so the lane split stays a single mechanism.
-   *
-   *  Known window: `msgLifecycleV1` is only learnable from the stream's first
-   *  `system`/init (the control-channel initialize carries no capabilities),
-   *  so a cancel that beats that drain seeds the COUNT lane on a
-   *  lifecycle-capable CLI — where command coalescing can leave the count
-   *  stale by N-1 (the pre-map bug, confined to this sub-second window and
-   *  still healed by the next activation's reset). Structural until the SDK
-   *  exposes capabilities before the stream starts. */
-  private trackOrphanCommand(
-    session: Session,
-    uuid: string,
-    state: "pending" | "started" | "zombie",
-  ): void {
-    if (session.msgLifecycleV1) {
-      session.orphanCommands ??= new Map();
-      session.orphanCommands.set(uuid, state);
-    } else {
-      session.pendingOrphanResults = (session.pendingOrphanResults ?? 0) + 1;
-    }
-  }
-
   async cancel(params: CancelNotification): Promise<void> {
     const session = this.sessions[params.sessionId];
     if (!session) {
@@ -3713,123 +2674,38 @@ export class ClaudeAcpAgent {
       return;
     }
     session.cancelled = true;
-    // Capture the orphan-accounting lane before anything can await: the
-    // consumer latches msgLifecycleV1 when it drains the first system/init,
-    // which can happen DURING the awaited interrupt() below — the receipt
-    // reconciliation must act on the same lane the seeding used, or a
-    // count-lane orphan would be left for the map-lane receipt path (which
-    // never decrements the count) to miss.
-    const lifecycleLane = session.msgLifecycleV1 === true;
     // Settle queued turns that haven't started yet (no echo seen) right away —
     // they have no in-flight SDK work to interrupt. The active turn is settled
     // by the consumer when it observes the interrupt's trailing idle (or via the
     // backstop below). Mirrors the old pendingMessages cancellation.
-    const orphanedTurns: Turn[] = [];
     if (session.turnQueue) {
+      let orphaned = 0;
       for (const turn of session.turnQueue) {
         if (turn !== session.activeTurn && !turn.settled) {
           turn.settled = true;
-          // Deliberately no `usage`: a queued turn never ran, so the session
-          // accumulator (the active turn's tally) is not its spend.
+          if (session.taskOwners) {
+            for (const taskId of turn.pendingTaskIds) {
+              if (session.taskOwners.get(taskId) === turn) {
+                session.taskOwners.delete(taskId);
+              }
+            }
+          }
+          turn.pendingTaskIds.clear();
+          turn.startedBackgroundTask = false;
+          turn.pendingCompletion = undefined;
+          turn.waitForBackgroundIdle = false;
           turn.resolve({ stopReason: "cancelled" });
-          orphanedTurns.push(turn);
+          orphaned++;
         }
       }
       // Each removed queued turn's user message was already pushed to the SDK,
       // which processes input FIFO and will still emit a result for it with no
-      // uuid to match. Track those so the consumer skips them (see
+      // uuid to match. Count those so the consumer skips them (see
       // ensureActiveTurn) rather than misattributing them to the head.
-      // msg_lifecycle_v1 CLIs get per-uuid tracking drained by the command's
-      // own terminal lifecycle frame — exact under command coalescing, where
-      // N queued commands fold into ONE turn emitting one result and a plain
-      // count would go stale by N-1 and swallow a later echo-less result.
-      // Older CLIs keep the count and its activation-time self-heal (they
-      // never see lifecycle frames, so commandStarted/commandFinished stay
-      // unset and every turn takes the plain-seed path below).
-      for (const turn of orphanedTurns) {
-        if (turn.commandFinished === "completed" || turn.commandFinished === "discarded") {
-          // The command already finished SDK-side and its terminal frame was
-          // consumed while the turn sat queued — nothing is left to skip, and
-          // a seeded entry would never drain.
-          continue;
-        }
-        if (turn.commandFinished === "cancelled") {
-          // Terminal frame already consumed. Dispatched-then-aborted: the
-          // dead turn's late result may still come — seed the zombie the
-          // frame handler would have made — unless that result already
-          // passed pre-cancel (commandResultSeen: e.g. the command folded
-          // into the active turn and their shared result was attributed
-          // there), in which case a zombie would be a phantom that swallows
-          // an unrelated later result. Never dispatched: dropped, no result
-          // coming, nothing to track.
-          if (turn.commandStarted && !turn.commandResultSeen) {
-            this.trackOrphanCommand(session, turn.promptUuid, "zombie");
-          }
-          continue;
-        }
-        if (turn.commandStarted && turn.commandResultSeen) {
-          // Dispatched and its turn's result already passed; only its
-          // terminal frame is outstanding, which no-ops with no entry.
-          continue;
-        }
-        this.trackOrphanCommand(
-          session,
-          turn.promptUuid,
-          turn.commandStarted ? "started" : "pending",
-        );
-      }
+      session.pendingOrphanResults = (session.pendingOrphanResults ?? 0) + orphaned;
       session.turnQueue = session.turnQueue.filter(
         (turn) => turn === session.activeTurn && !turn.settled,
       );
-    }
-
-    // A deferred active turn (see Turn.deferredSettle) already has its
-    // result — it is only held open for its background subagents, which the
-    // interrupt below tears down. Settle it "cancelled" NOW: during the hold
-    // the session is typically already in state idle (the CLI's trailer
-    // fired at the result), so the interrupt may produce no fresh idle for
-    // the consumer's cancelled-settle path to run on, and the cancel would
-    // otherwise stall until the force-cancel backstop. Any outstanding
-    // trailer debt is absorbed by the idle handler when its idle does come.
-    // The turn's own usage snapshot is reported per the cancelled-usage
-    // contract (issue #844).
-    {
-      const active = session.activeTurn;
-      if (isHeldOpen(active)) {
-        active.settled = true;
-        // Mirror settleActive's invariants (it is consumer-scoped and
-        // unreachable from here): disarm the backstop — none should be
-        // armed for a held turn, but a drift here must not leave a timer
-        // firing on a settled turn — and drop the turn from the queue.
-        disarmForceCancel(session);
-        session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== active);
-        session.activeTurn = null;
-        // Settling a held turn closes its delivery stretch: any streamed
-        // text since the last boundary was its followups', and left latched
-        // it would suppress a following replayed turn's issue-#453 fallback.
-        session.emittedAssistantText = false;
-        // When the interrupt below pre-empts a live cycle — running, or
-        // blocked on a permission request (requires_action, the #866 shape
-        // users cancel out of) — it produces a trailer idle with no counted
-        // result; with the hold's own trailer typically already absorbed,
-        // that idle would be un-owed and could lag past the next prompt's
-        // echo — read as the fresh turn ending without a result (issue #825
-        // false-fail). Pre-count it unless the session sits idle: there the
-        // interrupt emits nothing, and a debt that never drains would mask
-        // one future #825 detection. (lastSessionState is last-CONSUMED, so
-        // both stale reads exist and both are accepted one-cycle windows: a
-        // running transition still in the backlog reads as stale idle and
-        // under-counts — that false-fail additionally needs the trailer to
-        // lag past the next echo — while a cycle already completed into the
-        // backlog reads as stale non-idle and over-counts, masking one
-        // future #825 detection. Undefined — no state event consumed —
-        // pre-counts; that only occurs on CLIs whose missing idle events
-        // also disable the detector the debt could mask.)
-        if (session.lastSessionState !== "idle") {
-          session.owedTrailingIdles++;
-        }
-        active.resolve({ stopReason: "cancelled", usage: active.deferredSettle.usage });
-      }
     }
 
     // Arm a backstop before interrupting: if a turn is actively consuming the
@@ -3858,49 +2734,7 @@ export class ClaudeAcpAgent {
       }, this.forceCancelGraceMs);
     }
 
-    const receipt = await session.query.interrupt();
-    // On CLIs advertising `interrupt_receipt_v1`, the receipt's `still_queued`
-    // lists exactly which queued messages survive the interrupt and will still
-    // run. An orphaned turn whose uuid is absent was dropped by the interrupt
-    // and will never emit a result — uncount it now instead of leaving a stale
-    // skip that activateTurn's reset only clears once a later live ECHO
-    // arrives: an echo-less result in between (a local-only command like
-    // `/context`) would be wrongly swallowed by the leftover count. Subtracting
-    // a count (rather than tracking uuids) stays race-safe against the
-    // consumer draining concurrently: dropped uuids produce no results, so the
-    // consumer's decrements only ever consume the still-queued share. Unknown
-    // uuids in the receipt (internally-enqueued messages) are ignored, per its
-    // contract. Older CLIs resolve `undefined` (guard the FIELD, not just the
-    // receipt, so a bare `{}` success from a gateway can't read as "everything
-    // was dropped") — keep the count-everything behavior and its
-    // activation-time self-heal.
-    if (Array.isArray(receipt?.still_queued) && orphanedTurns.length > 0) {
-      const stillQueued = new Set(receipt.still_queued);
-      if (lifecycleLane) {
-        // Lifecycle lane: forget dropped orphans by uuid. Only entries still
-        // "pending" — an orphan absent from `still_queued` because it was
-        // DISPATCHED before the interrupt (not dropped) has usually been
-        // promoted to "started" by its lifecycle frame by now, and its own
-        // terminal frame must stay in charge of its fate. (If that frame is
-        // still in the consumer's backlog we mis-forget — the same exposure
-        // the count lane has always had for a dropped-then-run command.)
-        // Mostly redundant with the "cancelled"-frame removal, but a receipt
-        // survives paths where that frame was never emitted.
-        for (const turn of orphanedTurns) {
-          if (
-            !stillQueued.has(turn.promptUuid) &&
-            session.orphanCommands?.get(turn.promptUuid) === "pending"
-          ) {
-            session.orphanCommands.delete(turn.promptUuid);
-          }
-        }
-      } else {
-        const dropped = orphanedTurns.filter((turn) => !stillQueued.has(turn.promptUuid)).length;
-        if (dropped > 0) {
-          session.pendingOrphanResults = Math.max(0, (session.pendingOrphanResults ?? 0) - dropped);
-        }
-      }
-    }
+    await session.query.interrupt();
   }
 
   /** Mark a session's SDK query stream as permanently ended and release the
@@ -3948,7 +2782,10 @@ export class ClaudeAcpAgent {
     // after the floor, and clear the timer so it can't outlive the deleted
     // session (it isn't unref'd and would otherwise keep the event loop alive
     // until it fires).
-    disarmForceCancel(session);
+    if (session.forceCancelTimer) {
+      clearTimeout(session.forceCancelTimer);
+      session.forceCancelTimer = undefined;
+    }
     session.cancelController?.abort();
     this.closeQueryStream(session);
     // Abort the SDK abort signal only on explicit destroy. closeQueryStream
@@ -4037,38 +2874,18 @@ export class ClaudeAcpAgent {
         : [];
     let validValue = allValues.find((o) => o.value === params.value);
 
-    // The option's reported currentValue is always a valid target, even when
-    // it has no options entry: a session running an out-of-picker model
-    // (resumed onto an allowlist-excluded model, or a refusal fallback)
-    // reports a currentValue that isn't selectable, and a client
-    // round-tripping it must not get "Invalid value". It flows through the
-    // normal apply path below — re-asserting an already-current value is
-    // harmless and can repair SDK drift.
-    if (!validValue && option.currentValue === params.value) {
-      validValue = { value: params.value, name: params.value };
-    }
-
     // For model options, fall back to resolveModelPreference when the exact
     // value doesn't match.  This lets callers use human-friendly aliases like
     // "opus" or "sonnet" instead of full model IDs like "claude-opus-4-6".
-    // Resolve against session.modelInfos first: those entries carry
-    // `resolvedModel`, so a full model id (in either hint spelling) lands on
-    // the right row via the exact tier instead of a fuzzier one picking a
-    // same-family sibling from a different context lane. The options-derived
-    // list (which never carries `resolvedModel`) remains as a fallback for
-    // resolutions that don't map back onto a selectable option (e.g. a fuzzy
-    // hit on an out-of-picker verbatim entry).
     if (!validValue && params.configId === MODEL_CONFIG_ID) {
-      const toOptionValue = (resolved: ModelInfo | null) =>
-        resolved ? allValues.find((o) => o.value === resolved.value) : undefined;
-      validValue = toOptionValue(resolveModelPreference(session.modelInfos, params.value));
-      if (!validValue) {
-        const optionInfos: ModelInfo[] = allValues.map((o) => ({
-          value: o.value,
-          displayName: o.name,
-          description: o.description ?? "",
-        }));
-        validValue = toOptionValue(resolveModelPreference(optionInfos, params.value));
+      const modelInfos: ModelInfo[] = allValues.map((o) => ({
+        value: o.value,
+        displayName: o.name,
+        description: o.description ?? "",
+      }));
+      const resolved = resolveModelPreference(modelInfos, params.value);
+      if (resolved) {
+        validValue = allValues.find((o) => o.value === resolved.value);
       }
     }
 
@@ -4152,13 +2969,6 @@ export class ClaudeAcpAgent {
         replaySession.messageIdToUuid.set(replayMessageId, message.uuid);
       }
 
-      // The live prompt loop converts the synthetic "Please run /login"
-      // assistant message into an authRequired error instead of showing its
-      // TUI-specific text; skip it on replay too (issue #863).
-      if (message.type === "assistant" && isSyntheticLoginMessage(message.message)) {
-        continue;
-      }
-
       // @ts-expect-error - untyped in SDK but we handle all of these
       let content: unknown = message.message.content;
       // @ts-expect-error - untyped in SDK but we handle all of these
@@ -4210,7 +3020,6 @@ export class ClaudeAcpAgent {
     params: RequestPermissionRequest,
     toolName: string,
     signal: AbortSignal,
-    parentToolUseId?: string,
   ): Promise<RequestPermissionResponse> {
     // The SDK may invoke `canUseTool` (and therefore this permission request)
     // before the assistant message's tool_use block streams to us. Some ACP clients
@@ -4223,7 +3032,6 @@ export class ClaudeAcpAgent {
       toolName,
       params.toolCall.toolCallId,
       params.toolCall.rawInput,
-      parentToolUseId,
     );
     try {
       return await this.client.requestPermission(params, signal);
@@ -4241,21 +3049,15 @@ export class ClaudeAcpAgent {
    *  instead of emitting a duplicate (see `emittedToolCalls`). Built via the same
    *  `toolCallNotification` helper as the streamed path so the two are identical.
    *  Tools the stream renders as a plan (TodoWrite) or suppresses (Task*) are
-   *  emitted too: a permission request referencing a tool call the client has
-   *  never seen can trip strict clients (issue #851), so the reference must
-   *  always resolve. Since the streamed path never completes those calls, they
-   *  are resolved at tool_result time instead (see `toAcpNotifications`).
-   *  `parentToolUseId` attributes a subagent's tool call to the Agent/Task call
-   *  that spawned it, matching the streamed path's `_meta`. */
+   *  skipped so a permission prompt for them never surfaces a stray tool_call. */
   private async ensureToolCallEmitted(
     sessionId: string,
     toolName: string,
     toolCallId: string,
     toolInput: unknown,
-    parentToolUseId?: string,
   ): Promise<void> {
     const session = this.sessions[sessionId];
-    if (!session) {
+    if (!session || !shouldEmitToolCall(toolName)) {
       return;
     }
     if (session.emittedToolCalls.has(toolCallId)) {
@@ -4263,26 +3065,19 @@ export class ClaudeAcpAgent {
     }
     session.emittedToolCalls.add(toolCallId);
     const supportsTerminalOutput = this.clientCapabilities?._meta?.["terminal_output"] === true;
-    const update = toolCallNotification(
-      { id: toolCallId, name: toolName, input: toolInput },
-      toolInput,
-      supportsTerminalOutput,
-      session.cwd,
-    );
-    if (parentToolUseId) {
-      update._meta = {
-        ...update._meta,
-        claudeCode: {
-          ...(update._meta?.claudeCode || {}),
-          parentToolUseId,
-        },
-      };
-    }
-    await this.client.sessionUpdate({ sessionId, update });
+    await this.client.sessionUpdate({
+      sessionId,
+      update: toolCallNotification(
+        { id: toolCallId, name: toolName, input: toolInput },
+        toolInput,
+        supportsTerminalOutput,
+        session.cwd,
+      ),
+    });
   }
 
   canUseTool(sessionId: string): CanUseTool {
-    return async (toolName, toolInput, { signal, suggestions, toolUseID, agentID }) => {
+    return async (toolName, toolInput, { signal, suggestions, toolUseID }) => {
       const alwaysAllowLabel = describeAlwaysAllow(suggestions, toolName);
       const supportsTerminalOutput = this.clientCapabilities?._meta?.["terminal_output"] === true;
       const session = this.sessions[sessionId];
@@ -4293,26 +3088,6 @@ export class ClaudeAcpAgent {
         };
       }
 
-      // When the tool call originates inside a subagent, attribute the eagerly
-      // emitted tool_call (and the permission request itself) to the Agent/Task
-      // tool call that spawned the subagent, mirroring the streamed subagent
-      // path's `_meta.claudeCode.parentToolUseId` (see `liveBackgroundTasks`).
-      const parentToolUseId = agentID
-        ? session.liveBackgroundTasks.get(agentID)?.parentToolUseId
-        : undefined;
-      if (agentID && !parentToolUseId) {
-        // The attribution rests on an undocumented SDK invariant
-        // (task_started.task_id === canUseTool's agentID for subagent tasks;
-        // verified against the bundled CLI). Should an SDK bump break it — or
-        // the consumer lose the race with task_started — the lookup misses and
-        // the request goes out unattributed; log it so the regression is
-        // observable rather than silent.
-        this.logger.log(
-          `[claude-agent-acp] No parent tool_use recorded for subagent ${agentID}; ` +
-            `sending the ${toolName} permission request unattributed`,
-        );
-      }
-
       // AskUserQuestion is surfaced to us as a normal permission check (the SDK
       // routes it through canUseTool whenever a callback is registered, rather
       // than the interactive dialog). Present it as an ACP form elicitation and
@@ -4320,13 +3095,7 @@ export class ClaudeAcpAgent {
       if (toolName === "AskUserQuestion" && this.clientCapabilities?.elicitation?.form) {
         // Like permission requests, the elicitation references this toolUseID, so
         // make sure the tool_call has surfaced to the client before we send it.
-        await this.ensureToolCallEmitted(
-          sessionId,
-          toolName,
-          toolUseID,
-          toolInput,
-          parentToolUseId,
-        );
+        await this.ensureToolCallEmitted(sessionId, toolName, toolUseID, toolInput);
         return this.handleAskUserQuestion(sessionId, toolInput, toolUseID, signal);
       }
 
@@ -4369,16 +3138,10 @@ export class ClaudeAcpAgent {
                 supportsTerminalOutput,
                 session?.cwd,
               ),
-              // `claudeCode` metas always carry `toolName` (see ToolUpdateMeta),
-              // so clients can rely on one shape everywhere.
-              ...(parentToolUseId
-                ? { _meta: { claudeCode: { toolName, parentToolUseId } } satisfies ToolUpdateMeta }
-                : {}),
             },
           },
           toolName,
           signal,
-          parentToolUseId,
         );
 
         if (signal.aborted || response.outcome?.outcome === "cancelled") {
@@ -4448,16 +3211,10 @@ export class ClaudeAcpAgent {
               supportsTerminalOutput,
               session?.cwd,
             ),
-            // `claudeCode` metas always carry `toolName` (see ToolUpdateMeta),
-            // so clients can rely on one shape everywhere.
-            ...(parentToolUseId
-              ? { _meta: { claudeCode: { toolName, parentToolUseId } } satisfies ToolUpdateMeta }
-              : {}),
           },
         },
         toolName,
         signal,
-        parentToolUseId,
       );
       if (signal.aborted || response.outcome?.outcome === "cancelled") {
         throw new Error("Tool use aborted");
@@ -4662,22 +3419,16 @@ export class ClaudeAcpAgent {
       // carries no "1m" token.
       const newModelInfo = session.modelInfos.find((m) => m.value === value);
       if (session.models.currentModelId !== value) {
-        // The cached context window was learned for the previous model. The
-        // SDK is already running the new model here (user-driven switches call
-        // `query.setModel` before this, and the refusal-fallback sync only
-        // reconciles a switch the SDK already made), so ask it for the new
-        // window; fall back to the text heuristic so mid-stream updates
-        // between now and the next `result` reflect the user's selection
-        // instead of the old model's window.
+        // The cached context window was learned for the previous model; reset
+        // to the new model's heuristic so mid-stream updates between now and
+        // the next `result` reflect the user's selection instead of the old
+        // model's window.
         session.contextWindowSize =
-          (await fetchContextWindowSize(session.query, this.logger)) ??
           inferContextWindowFromModel(
             value,
-            newModelInfo?.resolvedModel,
             newModelInfo?.displayName,
             newModelInfo?.description,
-          ) ??
-          DEFAULT_CONTEXT_WINDOW;
+          ) ?? DEFAULT_CONTEXT_WINDOW;
       }
       session.models = { ...session.models, currentModelId: value };
 
@@ -5106,10 +3857,7 @@ export class ClaudeAcpAgent {
       env: {
         ...process.env,
         ...userProvidedOptions?.env,
-        // Client-managed LLM routing: `providers/set` config wins, else the
-        // legacy gateway auth request. Baked into the query at creation, so it
-        // only affects sessions started after the change (matching the RFD).
-        ...createEnvForProvider(this.resolveProviderConfig()),
+        ...createEnvForGateway(this.gatewayAuthRequest),
         // Opt-in to session state events like when the agent is idle
         CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
       },
@@ -5285,44 +4033,11 @@ export class ClaudeAcpAgent {
       initializationResult.models,
       settingsManager,
       this.logger,
-      creationOpts.resume !== undefined,
     );
 
     // Gate `auto` (and future model-specific modes) on the resolved model's
     // `ModelInfo`. See `buildAvailableModes` for the canonical SDK signal.
-    // A resumed session can be running a model outside the `availableModels`
-    // allowlist (currentModelId is then the verbatim live id, see
-    // `matchResumedModel`); its capabilities are still known to the SDK's
-    // unfiltered list, so fall back to that before treating the model as
-    // unknown — otherwise auto mode would be spuriously clamped and the
-    // Fast-mode/Effort options hidden for a model that supports them.
-    const allowlistedModelInfo = allowedModels.find((m) => m.value === models.currentModelId);
-    const fallbackModelInfo = allowlistedModelInfo
-      ? undefined
-      : (resolveModelPreference(initializationResult.models, models.currentModelId) ?? undefined);
-    const currentModelInfo = allowlistedModelInfo ?? fallbackModelInfo;
-    // Register the fallback-resolved capabilities under the verbatim live id
-    // so every modelInfos consumer (buildConfigOptions' effort lookup, later
-    // rebuilds via session.modelInfos) agrees with the gating below. The
-    // picker options themselves come from `models.availableModels`, so this
-    // adds no selectable entry. The spread keeps every capability flag
-    // (current and future); the identity fields are overridden because the
-    // fuzzy-matched sibling's resolvedModel/displayName/description can
-    // describe a different context lane and would poison later resolvedModel
-    // matching (syncModelAfterRefusalFallback) and context-window inference
-    // (applyConfigOptionValue) if they traveled under this id.
-    const modelInfos = fallbackModelInfo
-      ? [
-          ...allowedModels,
-          {
-            ...fallbackModelInfo,
-            value: models.currentModelId,
-            displayName: models.currentModelId,
-            description: "",
-            resolvedModel: undefined,
-          },
-        ]
-      : allowedModels;
+    const currentModelInfo = allowedModels.find((m) => m.value === models.currentModelId);
     const availableModes = buildAvailableModes(currentModelInfo);
 
     // Clamp `permissionMode` if the resolved session does not offer it. The
@@ -5388,7 +4103,7 @@ export class ClaudeAcpAgent {
     const configOptions = buildConfigOptions(
       modes,
       models,
-      modelInfos,
+      allowedModels,
       settingsManager.getSettings().effortLevel,
       agents,
       currentAgent,
@@ -5406,29 +4121,6 @@ export class ClaudeAcpAgent {
         effortLevel: initialEffort.currentValue as Settings["effortLevel"],
       });
     }
-    // Seed the context window from the SDK's authoritative report. Text
-    // inference alone misses aliases that resolve to extended-context models
-    // with no "1m" token anywhere in their id or description (e.g. `sonnet` →
-    // claude-sonnet-5, natively ~1M): those streamed `usage_update.size:
-    // 200000` until the first result's modelUsage corrected it — again on
-    // every process restart or session re-creation, since the learned window
-    // lives only on the Session (issue #596).
-    //
-    // The inference fallback is deliberately keyed to the allowlisted entry: a
-    // fallback-resolved sibling's resolvedModel/displayName/description can
-    // describe a different context lane than the verbatim live id (e.g. an
-    // "opus[1m]" row matched for a bare 200k id), so on the fallback path only
-    // the id itself is a trustworthy window signal.
-    const contextWindowSize =
-      (await fetchContextWindowSize(q, this.logger)) ??
-      inferContextWindowFromModel(
-        models.currentModelId,
-        allowlistedModelInfo?.resolvedModel,
-        allowlistedModelInfo?.displayName,
-        allowlistedModelInfo?.description,
-      ) ??
-      DEFAULT_CONTEXT_WINDOW;
-
     this.sessions[sessionId] = {
       query: q,
       input: input,
@@ -5444,20 +4136,22 @@ export class ClaudeAcpAgent {
       },
       modes,
       models,
-      modelInfos,
+      modelInfos: allowedModels,
       configOptions,
       agents,
       currentAgent,
       fastModeEnabled,
       abortController,
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
-      contextWindowSize,
+      contextWindowSize:
+        inferContextWindowFromModel(
+          models.currentModelId,
+          currentModelInfo?.displayName,
+          currentModelInfo?.description,
+        ) ?? DEFAULT_CONTEXT_WINDOW,
       taskState,
       toolUseCache: {},
       emittedToolCalls: new Set(),
-      liveBackgroundTasks: new Map(),
-      emittedAssistantText: false,
-      owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
     };
 
@@ -5553,79 +4247,27 @@ function snapshotFromUsage(usage: {
   };
 }
 
-/**
- * Adapt a legacy gateway `authenticate` request into the shared
- * {@link ProviderConfig} shape. Returns `null` when no gateway request is
- * present. `methodId` selects the protocol: `gateway-bedrock` → bedrock,
- * otherwise anthropic.
- */
-function gatewayRequestToProviderConfig(request?: GatewayAuthRequest): ProviderConfig | null {
+function createEnvForGateway(request?: GatewayAuthRequest) {
   if (!request?._meta) {
-    return null;
-  }
-  return {
-    apiType: request.methodId === "gateway-bedrock" ? "bedrock" : "anthropic",
-    baseUrl: request._meta.gateway.baseUrl,
-    headers: request._meta.gateway.headers,
-  };
-}
-
-/**
- * Map a resolved provider config into the Claude Code env vars that redirect API
- * traffic and inject headers. Returns an empty object when routing is
- * unconfigured. The token/bypass placeholders (`" "`) are required so the CLI
- * skips its normal login/credential checks when a gateway is in use.
- */
-function createEnvForProvider(config: ProviderConfig | null): Record<string, string> {
-  if (!config) {
     return {};
   }
-  const customHeaders = Object.entries(config.headers)
+  const customHeaders = Object.entries(request._meta.gateway.headers)
     .map(([key, value]) => `${key}: ${value}`)
     .join("\n");
 
-  if (config.apiType === "bedrock") {
+  if (request.methodId === "gateway-bedrock") {
     return {
       CLAUDE_CODE_USE_BEDROCK: "1",
       AWS_BEARER_TOKEN_BEDROCK: " ", // Must be non-empty to bypass pass configuration check
-      ANTHROPIC_BEDROCK_BASE_URL: config.baseUrl,
+      ANTHROPIC_BEDROCK_BASE_URL: request._meta.gateway.baseUrl,
       ANTHROPIC_CUSTOM_HEADERS: customHeaders,
     };
   }
-
-  if (config.apiType === "vertex") {
-    // `config.vertex` is guaranteed present for vertex by `unstable_setProvider`
-    // validation; fall back to empty strings defensively.
-    return {
-      CLAUDE_CODE_USE_VERTEX: "1",
-      ANTHROPIC_VERTEX_BASE_URL: config.baseUrl,
-      ANTHROPIC_VERTEX_PROJECT_ID: config.vertex?.projectId ?? "",
-      CLOUD_ML_REGION: config.vertex?.region ?? "",
-      ANTHROPIC_CUSTOM_HEADERS: customHeaders,
-    };
-  }
-
   return {
-    ANTHROPIC_BASE_URL: config.baseUrl,
+    ANTHROPIC_BASE_URL: request._meta.gateway.baseUrl,
     ANTHROPIC_CUSTOM_HEADERS: customHeaders,
     ANTHROPIC_AUTH_TOKEN: " ", // Must be specified to bypass claude login requirement
   };
-}
-
-/**
- * Validate a provider base URL: must be a non-empty absolute http(s) URL.
- */
-function isValidBaseUrl(baseUrl: string): boolean {
-  if (typeof baseUrl !== "string" || baseUrl.trim() === "") {
-    return false;
-  }
-  let parsed: URL;
-  try {
-    parsed = new URL(baseUrl);
-  } catch {
-    return false;
-  }
-  return parsed.protocol === "http:" || parsed.protocol === "https:";
 }
 
 /**
@@ -5923,37 +4565,15 @@ export function buildConfigOptions(
 // but the SDK model list uses IDs like "claude-opus-4-6-1m".
 const MODEL_CONTEXT_HINT_PATTERN = /\[(\d+m)\]$/i;
 
-// The id-suffix spelling of a context hint ("-1m" in "claude-opus-4-6-1m");
-// shared by the strip and canonicalize helpers below so the two can't drift.
-const CONTEXT_HINT_SUFFIX_PATTERN = /-(\d+m)$/i;
-
-/** Remove context-window hints — the display form "[1m]" and the SDK id
- *  suffix form "-1m" — from a model string. Those digits describe context
- *  size, not model identity or generation version. */
-function stripContextHints(s: string): string {
-  return s.replace(/\[\d+m\]/gi, "").replace(CONTEXT_HINT_SUFFIX_PATTERN, "");
-}
-
-/** Canonicalize a model id for exact comparison: trimmed, lowercased, with
- *  the id-suffix hint spelling unified to the bracket form ("-1m" → "[1m]").
- *  The hint itself is kept — bare and 1M ids must stay distinct. */
-function canonicalizeModelId(s: string): string {
-  return s.trim().toLowerCase().replace(CONTEXT_HINT_SUFFIX_PATTERN, "[$1]");
-}
-
-/** The context hint a model string carries ("1m" for either spelling), or
- *  null for a bare id. */
-function contextHintOf(s: string): string | null {
-  return canonicalizeModelId(s).match(MODEL_CONTEXT_HINT_PATTERN)?.[1] ?? null;
-}
-
 // Captures a model family version: `4-6`/`4.7` for dated generations, or a
 // bare `5` for single-number ones like "Sonnet 5". Used to keep a pinned
 // `claude-opus-4-6` from matching the `opus` alias once it points at 4.7.
 const MODEL_FAMILY_VERSION_PATTERN = /\b(\d+)(?:[-.](\d+))?\b/;
 
 function extractModelFamilyVersion(s: string): string | null {
-  const match = stripContextHints(s).match(MODEL_FAMILY_VERSION_PATTERN);
+  // Strip "[1m]"-style context hints first — that digit is context window
+  // size, not a model generation version.
+  const match = s.replace(/\[\d+m\]/gi, "").match(MODEL_FAMILY_VERSION_PATTERN);
   if (!match) return null;
   return match[2] ? `${match[1]}.${match[2]}` : match[1];
 }
@@ -6007,13 +4627,11 @@ export function resolveModelPreference(models: ModelInfo[], preference: string):
 
   const lower = trimmed.toLowerCase();
 
-  // Exact match on value or display name. Values compare on the canonical
-  // hint spelling so "opus-1m" hits an "opus[1m]" row (and vice versa).
-  const canonicalPreference = canonicalizeModelId(trimmed);
+  // Exact match on value or display name
   const directMatch = models.find(
     (model) =>
       model.value === trimmed ||
-      canonicalizeModelId(model.value) === canonicalPreference ||
+      model.value.toLowerCase() === lower ||
       model.displayName.toLowerCase() === lower,
   );
   if (directMatch) return directMatch;
@@ -6021,27 +4639,18 @@ export function resolveModelPreference(models: ModelInfo[], preference: string):
   // Exact match on the alias's canonical resolved id (e.g. a pinned
   // "claude-sonnet-5" against the "sonnet" row's `resolvedModel`). SDK-
   // reported and unambiguous, so it's tried before the fuzzier tiers below.
-  // Compared on the canonical hint spelling so a "-1m"-suffix pin matches a
-  // "[1m]"-spelled resolvedModel instead of falling into the substring tier
-  // (which would land on the bare 200k sibling). "default" is skipped first
-  // since it shares a resolvedModel with whichever alias the CLI currently
-  // recommends — a specific pin should land on that named alias, not
-  // "default".
-  const matchesResolved = (model: ModelInfo) =>
-    model.resolvedModel != null && canonicalizeModelId(model.resolvedModel) === canonicalPreference;
+  // "default" is skipped first since it shares a resolvedModel with
+  // whichever alias the CLI currently recommends — a specific pin should
+  // land on that named alias, not "default".
   const resolvedMatch =
-    models.find((model) => model.value !== "default" && matchesResolved(model)) ??
-    models.find(matchesResolved);
+    models.find(
+      (model) => model.value !== "default" && model.resolvedModel?.toLowerCase() === lower,
+    ) ?? models.find((model) => model.resolvedModel?.toLowerCase() === lower);
   if (resolvedMatch) return resolvedMatch;
 
-  // Substring match. Skips candidates whose context hint disagrees with the
-  // preference's — a bare row must not absorb a 1M-hinted preference (nor
-  // vice versa); such pairs fall through to the tokenized tier, which
-  // weighs hints in its scoring and still finds the best same-family row.
-  const preferenceHint = contextHintOf(trimmed);
+  // Substring match
   const includesMatch = models.find((model) => {
     if (!modelVersionsCompatible(trimmed, model)) return false;
-    if (contextHintOf(model.value) !== preferenceHint) return false;
     const value = model.value.toLowerCase();
     const display = model.displayName.toLowerCase();
     return value.includes(lower) || display.includes(lower) || lower.includes(value);
@@ -6064,61 +4673,6 @@ export function resolveModelPreference(models: ModelInfo[], preference: string):
   }
 
   return bestMatch;
-}
-
-/** Map the live model reported by a resumed session onto the picker's model
- *  list. The CLI restores a resumed session's model from the transcript's
- *  last assistant message, which records the concrete API id (e.g.
- *  "claude-opus-4-6") with any "[1m]" context hint dropped. Tiers, in order:
- *  1. Exact match with the Default entry's resolution — when a named alias
- *     shares Default's resolvedModel verbatim, the live id can't tell the
- *     two apart, and a never-customized session should stay on Default.
- *  2. Exact resolvedModel match on a named row. Checked before the
- *     hint-stripped Default comparison so a live "claude-sonnet-5[1m]" lands
- *     on the "sonnet[1m]" row rather than a Default that resolves to the
- *     bare "claude-sonnet-5" — the two rows differ in context window, which
- *     drives `contextWindowSize` and capability gating downstream.
- *  3. Hint-stripped match with Default's resolution — a session that never
- *     left the default resumes as the bare transcript id, and shouldn't show
- *     a concrete picker entry.
- *  4. `resolveModelPreference` over the picker entries.
- *  5. A model with no picker counterpart (e.g. excluded by an
- *     `availableModels` allowlist) is tracked verbatim, mirroring
- *     `syncModelAfterRefusalFallback`: the picker shows no selection, but the
- *     model-dependent bookkeeping stays truthful to what the SDK is running. */
-export function matchResumedModel(models: ModelInfo[], liveModel: string): ModelInfo {
-  const live = canonicalizeModelId(liveModel);
-  const defaultEntry = models.find((m) => m.value === "default");
-  const defaultResolved = defaultEntry?.resolvedModel
-    ? canonicalizeModelId(defaultEntry.resolvedModel)
-    : undefined;
-
-  if (defaultEntry && defaultResolved === live) {
-    return defaultEntry;
-  }
-
-  // No default-row exclusion needed: a default row matching `live` exactly
-  // already returned at the tier above.
-  const exactMatch = models.find(
-    (m) => m.resolvedModel && canonicalizeModelId(m.resolvedModel) === live,
-  );
-  if (exactMatch) return exactMatch;
-
-  if (
-    defaultEntry &&
-    defaultResolved &&
-    stripContextHints(defaultResolved) === stripContextHints(live)
-  ) {
-    return defaultEntry;
-  }
-
-  return (
-    resolveModelPreference(models, liveModel) ?? {
-      value: liveModel,
-      displayName: liveModel,
-      description: "",
-    }
-  );
 }
 
 function resolveSettingsModel(
@@ -6213,32 +4767,12 @@ export function applyAvailableModelsAllowlist(
   return result;
 }
 
-/** Read the model a resumed session is actually running (via the
- *  `getContextUsage` control request — the same source `/context` prints) and
- *  map it onto the picker. Best-effort: a control-request failure is logged
- *  and returns null so callers keep their current choice; failing the whole
- *  session/load over an unreadable report would be worse. */
-async function readResumedLiveModel(
-  query: Query,
-  models: ModelInfo[],
-  logger: Logger,
-): Promise<ModelInfo | null> {
-  try {
-    const liveModel = (await query.getContextUsage()).model;
-    return liveModel ? matchResumedModel(models, liveModel) : null;
-  } catch (error) {
-    logger.error("Failed to read the resumed session's live model:", error);
-    return null;
-  }
-}
-
 async function getAvailableModels(
   query: Query,
   models: ModelInfo[],
   sdkModels: ModelInfo[],
   settingsManager: SettingsManager,
   logger: Logger,
-  isResumedSession: boolean,
 ): Promise<SessionModelState> {
   const settings = settingsManager.getSettings();
 
@@ -6248,8 +4782,7 @@ async function getAvailableModels(
   // Model priority (highest to lowest):
   // 1. ANTHROPIC_MODEL environment variable
   // 2. settings.model (user configuration)
-  // 3. the resumed session's live model (resumed sessions only)
-  // 4. models[0] (default first model)
+  // 3. models[0] (default first model)
   if (process.env.ANTHROPIC_MODEL) {
     const match = resolveModelPreference(models, process.env.ANTHROPIC_MODEL);
     if (match) {
@@ -6264,49 +4797,22 @@ async function getAvailableModels(
     }
   }
 
-  // A resumed session restores the model it was previously running (the CLI
-  // re-reads it from the transcript), so without an env/settings override the
-  // freshly-computed default above can disagree with what the session actually
-  // runs — session/load then reports a model the session isn't using (issue
-  // #845). Ask the CLI for the live model and reflect it. No `setModel` here:
-  // the SDK is already running this model, and pushing a picker alias back
-  // (e.g. "opus[1m]") could change the live model rather than describe it.
-  if (resolvedFromInput === undefined && isResumedSession) {
-    currentModel = (await readResumedLiveModel(query, models, logger)) ?? currentModel;
-  }
-
   // Skip the setModel round-trip when we can prove the SDK has already landed
   // on the same model. Two cases qualify:
-  //  (a) No override applied — currentModel is the SDK's own default (or, on
-  //      resume, the live model read back from the SDK above); nothing to sync.
+  //  (a) No override applied — currentModel stayed at models[0]; the SDK is on
+  //      its own default and we have nothing to sync.
   //  (b) The resolver returned the user's input verbatim AND that value exists
   //      in the SDK's original model list — meaning no fuzzy match or
   //      allowlist rewrite was involved, and the SDK (which reads the same
   //      ANTHROPIC_MODEL / settings.json) will have arrived at the same entry.
-  //      This only holds for fresh sessions: a resumed session lands on the
-  //      transcript's model regardless of env/settings, so the override must
-  //      be re-asserted to keep the reported model truthful.
   // Anything else (fuzzy match, allowlist-synthesized value, alias) gets a
   // setModel call so we don't drift from the user's intended pin.
   const sdkSawSameValue = sdkModels.some((m) => m.value === currentModel.value);
   const skipSetModel =
     resolvedFromInput === undefined ||
-    (!isResumedSession && currentModel.value === resolvedFromInput && sdkSawSameValue);
+    (currentModel.value === resolvedFromInput && sdkSawSameValue);
   if (!skipSetModel) {
-    try {
-      await query.setModel(currentModel.value);
-    } catch (error) {
-      // On a fresh session the pin is a defining option — fail loudly. A
-      // resumed session already runs fine on the transcript's model, so
-      // failing the whole session/load over the re-assert would be worse
-      // than loading with the pin unapplied (mirrors the setPermissionMode
-      // containment in createSession). The SDK then stayed on the
-      // transcript's model, so read that back rather than reporting the
-      // pin the session isn't running.
-      if (!isResumedSession) throw error;
-      logger.error(`Failed to re-assert model "${currentModel.value}" on resume:`, error);
-      currentModel = (await readResumedLiveModel(query, models, logger)) ?? currentModel;
-    }
+    await query.setModel(currentModel.value);
   }
 
   return {
@@ -6509,12 +5015,10 @@ function isTaskTool(toolName: string): boolean {
   );
 }
 
-/** Whether the streamed tool_use path surfaces this tool as a standalone
+/** Whether a tool's tool_use surfaces to the client as a standalone
  *  `tool_call`. TodoWrite is rendered as a `plan` and Task* tools are
  *  suppressed (their plan snapshot is emitted at tool_result time), so neither
- *  produces a streamed tool_call/tool_call_update — which means a
- *  permission-surfaced tool_call for them (see `ensureToolCallEmitted`) must be
- *  resolved explicitly at tool_result time. */
+ *  produces a tool_call. */
 function shouldEmitToolCall(toolName: string): boolean {
   return toolName !== "TodoWrite" && !isTaskTool(toolName);
 }
@@ -6557,38 +5061,6 @@ function toolCallNotification(
   };
 }
 
-/** Refine a pending tool call from the complete top-level fields recovered
- *  from its still-streaming input. Shares `toolInfoFromToolUse` with the
- *  consolidated path but never carries `content`: content built from partial
- *  input is misleading (an Edit missing its `new_string` renders as a pure
- *  deletion) or invalid (a Write diff without `content` lacks the required
- *  `newText`), and the consolidated message supplies it moments later. */
-function streamedInputRefinement(
-  toolUse: { id: string; name: string },
-  input: Record<string, unknown>,
-  supportsTerminalOutput: boolean,
-  cwd?: string,
-): SessionNotification["update"] | undefined {
-  // TodoWrite/Task* never surfaced a tool_call to refine (plan lane).
-  if (!shouldEmitToolCall(toolUse.name)) {
-    return undefined;
-  }
-  const { title, kind, locations } = toolInfoFromToolUse(
-    { ...toolUse, input },
-    supportsTerminalOutput,
-    cwd,
-  );
-  return {
-    _meta: { claudeCode: { toolName: toolUse.name } } satisfies ToolUpdateMeta,
-    toolCallId: toolUse.id,
-    sessionUpdate: "tool_call_update",
-    rawInput: input,
-    title,
-    kind,
-    ...(locations ? { locations } : {}),
-  };
-}
-
 /**
  * Convert an SDKAssistantMessage (Claude) to a SessionNotification (ACP).
  * Only handles text, image, and thinking chunks for now.
@@ -6619,11 +5091,6 @@ export function toAcpNotifications(
     // into a single message. Omit it (leave undefined) when unknown — never send
     // an explicit `null`.
     messageId?: string;
-    // The SDK user message's `tool_use_result`: the structured Output object of
-    // the tool_result this message carries (shape is per-tool). Used to render
-    // Agent/Task results from the structured subagent report instead of the raw
-    // text (which ends in a model-directed agentId/usage trailer).
-    toolUseResult?: unknown;
   },
 ): SessionNotification[] {
   const taskState = options?.taskState ?? new Map();
@@ -6655,25 +5122,14 @@ export function toAcpNotifications(
     return [{ sessionId, update }];
   }
 
-  // `tool_use_result` is message-level and carries no tool_use_id of its own:
-  // it describes "the" tool_result block of the message it rode in on. If
-  // several tool_result blocks were ever batched into one message it couldn't
-  // be attributed, so it is only honored when the message carries exactly one.
-  const toolUseResult =
-    options?.toolUseResult !== undefined &&
-    content.filter((c) => typeof c === "object" && c !== null && c.type === "tool_result")
-      .length === 1
-      ? options.toolUseResult
-      : undefined;
-
   const output = [];
   // Only handle the first chunk for streaming; extend as needed for batching
   for (const chunk of content) {
     let update: SessionNotification["update"] | null = null;
     switch (chunk.type) {
       case "text":
-      case "text_delta": {
-        if (chunk.text) {
+      case "text_delta":
+        if (chunk.text.length > 0) {
           update = {
             sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
             content: {
@@ -6683,7 +5139,6 @@ export function toAcpNotifications(
           };
         }
         break;
-      }
       case "image":
         update = {
           sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
@@ -6696,10 +5151,10 @@ export function toAcpNotifications(
         };
         break;
       case "thinking":
-      case "thinking_delta": {
+      case "thinking_delta":
         // Recent models default `thinking.display` to "omitted", which streams
         // signature-only thinking blocks whose text is empty.
-        if (chunk.thinking) {
+        if (chunk.thinking.length > 0) {
           update = {
             sessionUpdate: "agent_thought_chunk",
             content: {
@@ -6709,7 +5164,6 @@ export function toAcpNotifications(
           };
         }
         break;
-      }
       case "tool_use":
       case "server_tool_use":
       case "mcp_tool_use": {
@@ -6814,63 +5268,13 @@ export function toAcpNotifications(
       case "bash_code_execution_tool_result":
       case "text_editor_code_execution_tool_result":
       case "mcp_tool_result": {
-        const wasEmitted = options?.emittedToolCalls?.has(chunk.tool_use_id) === true;
         options?.emittedToolCalls?.delete(chunk.tool_use_id);
         const toolUse = toolUseCache[chunk.tool_use_id];
         if (!toolUse) {
-          // The permission flow may have surfaced this tool_call even though
-          // its tool_use never reached the cache (e.g. the assistant message
-          // carrying it was dropped by the cancelled-turn guard and a straggler
-          // result landed later). Resolve the surfaced call anyway so it can't
-          // stay pending in the client forever; without the cache entry the
-          // tool name is unknown, so no claudeCode meta is attached.
-          if (wasEmitted) {
-            output.push({
-              sessionId,
-              update: {
-                toolCallId: chunk.tool_use_id,
-                sessionUpdate: "tool_call_update" as const,
-                status:
-                  "is_error" in chunk && chunk.is_error
-                    ? ("failed" as const)
-                    : ("completed" as const),
-                rawOutput: chunk.content,
-              },
-            });
-          }
           logger.error(
             `[claude-agent-acp] Got a tool result for tool use that wasn't tracked: ${chunk.tool_use_id}`,
           );
           break;
-        }
-
-        // A permission request may have surfaced a plan-rendered (TodoWrite) or
-        // suppressed (Task*) tool as a real tool_call so the request referenced
-        // a tool call the client knows about (see `ensureToolCallEmitted`,
-        // issue #851). The branches below never emit a tool_call_update for
-        // those tools, which would leave the surfaced call pending in the
-        // client forever — resolve it here. `wasEmitted` is only ever true for
-        // these tools via the permission flow: the streamed plan/suppressed
-        // branches don't record emissions.
-        if (wasEmitted && !shouldEmitToolCall(toolUse.name)) {
-          output.push({
-            sessionId,
-            update: {
-              _meta: {
-                claudeCode: {
-                  toolName: toolUse.name,
-                  ...(options?.parentToolUseId ? { parentToolUseId: options.parentToolUseId } : {}),
-                },
-              } satisfies ToolUpdateMeta,
-              toolCallId: chunk.tool_use_id,
-              sessionUpdate: "tool_call_update" as const,
-              status:
-                "is_error" in chunk && chunk.is_error
-                  ? ("failed" as const)
-                  : ("completed" as const),
-              rawOutput: chunk.content,
-            },
-          });
         }
 
         if (isTaskTool(toolUse.name)) {
@@ -6902,7 +5306,6 @@ export function toAcpNotifications(
             chunk,
             toolUseCache[chunk.tool_use_id],
             supportsTerminalOutput,
-            toolUseResult,
           );
 
           // When terminal output is supported, send terminal_output as a
@@ -6996,101 +5399,28 @@ export function streamEventToAcpNotifications(
     taskState?: TaskState;
     emittedToolCalls?: Set<string>;
     messageId?: string;
-    streamedToolInputs?: StreamedToolInputCache;
   },
 ): SessionNotification[] {
   const event = message.event;
-  const streamKey = message.parent_tool_use_id ?? "";
-  const streamedToolInputs = options?.streamedToolInputs;
-  const forwardedOptions = {
-    clientCapabilities: options?.clientCapabilities,
-    parentToolUseId: message.parent_tool_use_id,
-    cwd: options?.cwd,
-    taskState: options?.taskState,
-    emittedToolCalls: options?.emittedToolCalls,
-    messageId: options?.messageId,
-  };
   switch (event.type) {
-    case "content_block_start": {
-      const block = event.content_block;
-      if (
-        streamedToolInputs &&
-        (block.type === "tool_use" ||
-          block.type === "server_tool_use" ||
-          block.type === "mcp_tool_use")
-      ) {
-        let inputsForMessage = streamedToolInputs.get(streamKey);
-        if (!inputsForMessage) {
-          inputsForMessage = new Map();
-          streamedToolInputs.set(streamKey, inputsForMessage);
-        }
-        inputsForMessage.set(event.index, {
-          id: block.id,
-          name: block.name,
-          partialJson: "",
-          scannedTo: 0,
-          inString: false,
-          escaped: false,
-          objectDepth: 0,
-          arrayDepth: 0,
-          lastTopLevelComma: -1,
-          emittedThroughComma: -1,
-        });
-      }
+    case "content_block_start":
       return toAcpNotifications(
-        [block],
+        [event.content_block],
         "assistant",
         sessionId,
         toolUseCache,
         client,
         logger,
-        forwardedOptions,
+        {
+          clientCapabilities: options?.clientCapabilities,
+          parentToolUseId: message.parent_tool_use_id,
+          cwd: options?.cwd,
+          taskState: options?.taskState,
+          emittedToolCalls: options?.emittedToolCalls,
+          messageId: options?.messageId,
+        },
       );
-    }
-    case "content_block_delta": {
-      if (event.delta.type === "input_json_delta") {
-        const streamedInput = streamedToolInputs?.get(streamKey)?.get(event.index);
-        if (!streamedInput) return [];
-
-        streamedInput.partialJson += event.delta.partial_json;
-        if (scanStreamedToolInput(streamedInput)) {
-          // Input complete: the consolidated assistant message replays the
-          // block with its full input and refines the call there; emitting
-          // here too would send a duplicate identical update.
-          const inputsForMessage = streamedToolInputs?.get(streamKey);
-          inputsForMessage?.delete(event.index);
-          if (inputsForMessage?.size === 0) streamedToolInputs?.delete(streamKey);
-          return [];
-        }
-        if (streamedInput.lastTopLevelComma <= streamedInput.emittedThroughComma) {
-          return [];
-        }
-        streamedInput.emittedThroughComma = streamedInput.lastTopLevelComma;
-        const input = recoveredToolInput(
-          streamedInput.partialJson.slice(0, streamedInput.lastTopLevelComma),
-        );
-        if (!input) return [];
-        const supportsTerminalOutput =
-          options?.clientCapabilities?._meta?.["terminal_output"] === true;
-        const update = streamedInputRefinement(
-          streamedInput,
-          input,
-          supportsTerminalOutput,
-          options?.cwd,
-        );
-        if (!update) return [];
-        if (message.parent_tool_use_id) {
-          update._meta = {
-            ...update._meta,
-            claudeCode: {
-              ...(update._meta?.claudeCode || {}),
-              parentToolUseId: message.parent_tool_use_id,
-            },
-          };
-        }
-        applyMessageId(update, options?.messageId);
-        return [{ sessionId, update }];
-      }
+    case "content_block_delta":
       return toAcpNotifications(
         [event.delta],
         "assistant",
@@ -7098,29 +5428,25 @@ export function streamEventToAcpNotifications(
         toolUseCache,
         client,
         logger,
-        forwardedOptions,
+        {
+          clientCapabilities: options?.clientCapabilities,
+          parentToolUseId: message.parent_tool_use_id,
+          cwd: options?.cwd,
+          taskState: options?.taskState,
+          emittedToolCalls: options?.emittedToolCalls,
+          messageId: options?.messageId,
+        },
       );
-    }
     // No content. `ping` is a Messages-API keep-alive event that the SDK's
     // `BetaRawMessageStreamEvent` union doesn't include even though the
     // wire format emits it; the `as never` cast lets us no-op it here
     // instead of letting it fall through to `unreachable`.
     case "ping" as never:
-    case "message_delta":
-      return [];
-    // A message boundary ends every input stream on this lane: message_stop is
-    // the normal end, and a message_start clears anything a prior message on
-    // the lane left behind (e.g. a stream cut short mid-block).
     case "message_start":
+    case "message_delta":
     case "message_stop":
-      streamedToolInputs?.delete(streamKey);
+    case "content_block_stop":
       return [];
-    case "content_block_stop": {
-      const inputsForMessage = streamedToolInputs?.get(streamKey);
-      inputsForMessage?.delete(event.index);
-      if (inputsForMessage?.size === 0) streamedToolInputs?.delete(streamKey);
-      return [];
-    }
 
     default:
       unreachable(event, logger);
@@ -7188,9 +5514,6 @@ export function runAcp() {
       agent.setSessionConfigOption(ctx.params),
     )
     .onRequest(methods.agent.authenticate, (ctx) => agent.authenticate(ctx.params))
-    .onRequest(methods.agent.providers.list, (ctx) => agent.unstable_listProviders(ctx.params))
-    .onRequest(methods.agent.providers.set, (ctx) => agent.unstable_setProvider(ctx.params))
-    .onRequest(methods.agent.providers.disable, (ctx) => agent.unstable_disableProvider(ctx.params))
     .onRequest(methods.agent.logout, (ctx) => agent.logout(ctx.params))
     .onRequest(methods.agent.session.prompt, (ctx) =>
       runPromptWithCancellation(agent, ctx.params, ctx.signal),
@@ -7217,14 +5540,12 @@ function commonPrefixLength(a: string, b: string) {
  *  Anthropic 1M-context variants encode "1m" as a distinct token in the SDK
  *  model ID (e.g., "claude-opus-4-6-1m"), which `\b1m\b` catches without also
  *  matching things like "10m" or embedded substrings. Semantic aliases like
- *  `default` carry no such token in the ID, but their `resolvedModel` and the
- *  SDK's human-facing `displayName`/`description` can (e.g.
- *  "claude-opus-4-8[1m]", "Opus 4.7 (1M context)"), so callers pass those too.
- *  This text scan can't catch every model — some resolve to extended-context
- *  models with no "1m" anywhere (e.g. `sonnet` → claude-sonnet-5, natively
- *  ~1M) — which is why `fetchContextWindowSize` is preferred wherever a live
- *  query is available. A miss falls back to the default window and is
- *  corrected by `result.modelUsage` within one turn. */
+ *  `default` carry no such token in the ID, but the SDK's human-facing
+ *  `displayName`/`description` do (e.g. "Opus 4.7 (1M context)"), so callers
+ *  pass those too — the same `\b1m\b` token appears in "1M context". The SDK's
+ *  `ModelInfo` exposes no structured context-window field, so this text scan is
+ *  the only pre-`result` signal available. A miss falls back to the default
+ *  window and is corrected by `result.modelUsage` within one turn. */
 function inferContextWindowFromModel(...texts: Array<string | undefined>): number | null {
   if (texts.some((text) => text != null && /\b1m\b/i.test(text))) return 1_000_000;
   return null;
@@ -7234,35 +5555,18 @@ function inferContextWindowFromModel(...texts: Array<string | undefined>): numbe
  *  `getContextUsage` control request. Unlike the per-message API usage numbers
  *  (which only count message tokens), this `totalTokens` includes the system
  *  prompt, tool schemas, MCP tools, and memory-file overhead — the real
- *  occupancy the user sees. Returns `null` on any control-request failure. */
+ *  occupancy the user sees. Returns `null` on any control-request failure.
+ *
+ *  Note: we deliberately do NOT use this response's window fields for `size`.
+ *  They have been observed to under-report extended (1M) context windows, so
+ *  the window keeps coming from `modelUsage` / `inferContextWindowFromModel`,
+ *  which handle the 1M variants correctly. */
 async function fetchContextUsedTokens(query: Query, logger: Logger): Promise<number | null> {
   try {
     const usage = await query.getContextUsage();
     return usage.totalTokens;
   } catch (error) {
     logger.error("Failed to fetch context usage from SDK:", error);
-    return null;
-  }
-}
-
-/** Fetch the current model's full context window (`rawMaxTokens`) via the
- *  `getContextUsage` control request — the same source `/context` prints.
- *  This is the only pre-`result` signal that covers semantic aliases whose
- *  text carries no "1m" token (e.g. `sonnet` → claude-sonnet-5, natively
- *  ~1M), so it's the primary window source at session creation and on model
- *  switches; `inferContextWindowFromModel` remains the fallback. A returned
- *  window is still superseded by each `result.modelUsage.contextWindow`.
- *
- *  (Older CLIs under-reported extended 1M windows here — commit 20ef663
- *  dropped the field for that reason — but the CLI vendored by the pinned
- *  SDK reports them correctly again.) Returns `null` on any control-request
- *  failure or a nonsensical (non-positive) window. */
-async function fetchContextWindowSize(query: Query, logger: Logger): Promise<number | null> {
-  try {
-    const usage = await query.getContextUsage();
-    return usage.rawMaxTokens > 0 ? usage.rawMaxTokens : null;
-  } catch (error) {
-    logger.error("Failed to fetch context window size from SDK:", error);
     return null;
   }
 }
