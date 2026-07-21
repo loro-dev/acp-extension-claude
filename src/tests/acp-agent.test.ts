@@ -76,6 +76,10 @@ import type {
   BetaCodeExecutionToolResultBlockParam,
 } from "@anthropic-ai/sdk/resources/beta.mjs";
 
+type NewSessionResponseWithAvailableCommands = NewSessionResponse & {
+  availableCommands: AvailableCommand[];
+};
+
 /** Build the replayed `user` message the SDK echoes back for a pushed prompt,
  *  used by mock generators to promote a turn to active. */
 function userEcho(u: any) {
@@ -307,7 +311,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
   async function setupTestSession(cwd: string): Promise<{
     client: TestClient;
     connection: TestConnection;
-    newSessionResponse: NewSessionResponse;
+    newSessionResponse: NewSessionResponseWithAvailableCommands;
   }> {
     const input = nodeToWebWritable(child.stdin!);
     const output = nodeToWebReadable(child.stdout!);
@@ -341,10 +345,10 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
       },
     });
 
-    const newSessionResponse = await ctx.request(methods.agent.session.new, {
+    const newSessionResponse = (await ctx.request(methods.agent.session.new, {
       cwd,
       mcpServers: [],
-    });
+    })) as NewSessionResponseWithAvailableCommands;
 
     const connection: TestConnection = {
       prompt: (params) => ctx.request(methods.agent.session.prompt, params),
@@ -372,7 +376,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
   it("should include available commands", async () => {
     const { client, connection, newSessionResponse } = await setupTestSession(__dirname);
 
-    const commands = await client.availableCommandsPromise;
+    const commands = newSessionResponse.availableCommands;
 
     expect(commands).toContainEqual({
       name: "quick-math",

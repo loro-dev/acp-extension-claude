@@ -129,6 +129,10 @@ import {
 } from "acp-extension-core";
 import { getUsage } from "./usage.js";
 
+type NewSessionResponseWithAvailableCommands = NewSessionResponse & {
+  availableCommands: AvailableCommand[];
+};
+
 export const CLAUDE_CONFIG_DIR =
   process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
 
@@ -1378,16 +1382,17 @@ export class ClaudeAcpAgent {
     };
   }
 
-  async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
+  async newSession(params: NewSessionRequest): Promise<NewSessionResponseWithAvailableCommands> {
     const response = await this.createSession(params, {
       // Revisit these meta values once we support resume
       resume: (params._meta as NewSessionMeta | undefined)?.claudeCode?.options?.resume,
     });
+    const availableCommands = await this.getAvailableCommands(response.sessionId);
     // Needs to happen after we return the session
     setTimeout(() => {
-      this.sendAvailableCommandsUpdate(response.sessionId);
+      this.sendAvailableCommandsUpdate(response.sessionId, availableCommands);
     }, 0);
-    return response;
+    return { ...response, availableCommands };
   }
 
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
@@ -4612,17 +4617,24 @@ export class ClaudeAcpAgent {
     };
   }
 
-  private async sendAvailableCommandsUpdate(sessionId: string): Promise<void> {
-    const session = this.sessions[sessionId];
-    if (!session) return;
-    const commands = await session.query.supportedCommands();
+  private async sendAvailableCommandsUpdate(
+    sessionId: string,
+    availableCommands?: AvailableCommand[],
+  ): Promise<void> {
+    const commands = availableCommands ?? (await this.getAvailableCommands(sessionId));
     await this.client.sessionUpdate({
       sessionId,
       update: {
         sessionUpdate: "available_commands_update",
-        availableCommands: getAvailableSlashCommands(commands),
+        availableCommands: commands,
       },
     });
+  }
+
+  private async getAvailableCommands(sessionId: string): Promise<AvailableCommand[]> {
+    const session = this.sessions[sessionId];
+    if (!session) return [];
+    return getAvailableSlashCommands(await session.query.supportedCommands());
   }
 
   private async updateConfigOption(
