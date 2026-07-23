@@ -129,6 +129,10 @@ import {
 } from "acp-extension-core";
 import { getUsage } from "./usage.js";
 
+type NewSessionResponseWithAvailableCommands = NewSessionResponse & {
+  availableCommands: AvailableCommand[];
+};
+
 export const CLAUDE_CONFIG_DIR =
   process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
 
@@ -426,11 +430,23 @@ type Session = {
    *  per-session, so this state must not be shared across sessions. */
   taskState: TaskState;
   /** Last session title we pushed to the client via `session_info_update`.
-   *  The SDK auto-generates a title in a background task and persists it to the
-   *  session file; we poll it on each turn-end (`session_state_changed: idle`)
-   *  and only notify the client when it actually changes. Undefined until the
-   *  first title is observed. */
+   *  The SDK auto-generates a title in a background task and persists it to
+   *  the session file; we poll it mid-turn (see `titlePollTimer`) and at
+   *  turn-end, and only notify the client when it actually changes. Only
+   *  titles backed by an explicit SDK title entry (user `/rename` or the
+   *  generated `aiTitle`) are ever pushed — never the SDK's prompt-fallback
+   *  `summary`. Undefined until the first title is observed. */
   lastTitle?: string;
+  /** Interval timer polling the SDK session file for a title while a turn is
+   *  running. The SDK writes its background-generated title within the first
+   *  few seconds of turn one — long before `idle` — so polling mid-turn gets
+   *  the real title to the client early. Started on `session_state_changed:
+   *  running` (until `lastTitle` is set), stopped on `idle`/teardown. */
+  titlePollTimer?: ReturnType<typeof setInterval>;
+  /** Guards against a duplicate push when the idle-time title check and the
+   *  poll timer overlap: both must pass the `lastTitle` check before either
+   *  finishes its `getSessionInfo` read. */
+  titleLookupInFlight?: boolean;
   /** Caches `tool_use` blocks by id so the matching `tool_result` can recover
    *  the tool name/input when mapping it to a `tool_call_update`. Per-session
    *  (tool_use ids are only unique within a session) and pruned at
@@ -1378,16 +1394,17 @@ export class ClaudeAcpAgent {
     };
   }
 
-  async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
+  async newSession(params: NewSessionRequest): Promise<NewSessionResponseWithAvailableCommands> {
     const response = await this.createSession(params, {
       // Revisit these meta values once we support resume
       resume: (params._meta as NewSessionMeta | undefined)?.claudeCode?.options?.resume,
     });
+    const availableCommands = await this.getAvailableCommands(response.sessionId);
     // Needs to happen after we return the session
     setTimeout(() => {
-      this.sendAvailableCommandsUpdate(response.sessionId);
+      this.sendAvailableCommandsUpdate(response.sessionId, availableCommands);
     }, 0);
-    return response;
+    return { ...response, availableCommands };
   }
 
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
@@ -1451,22 +1468,39 @@ export class ClaudeAcpAgent {
     };
   }
 
+  /** How often to re-read the SDK session file for a title while a turn is
+   *  running and no trustworthy title has been seen yet. Each read is just
+   *  the head+tail of the session JSONL, so a short interval is cheap. */
+  private static readonly TITLE_POLL_INTERVAL_MS = 2_000;
+
   /** Read the SDK-maintained title for a session and, if it changed since the
    *  last time we looked, notify the client with a `session_info_update`. The
-   *  SDK has no push event for the title it auto-generates in the background, so
-   *  we pull it at turn-end. A missing session file or read error is non-fatal:
-   *  the title is best-effort and another turn will retry. */
+   *  SDK has no push event for the title it auto-generates in the background,
+   *  so we poll it mid-turn (see `startSessionTitlePolling`) and once more at
+   *  turn-end. A missing session file or read error is non-fatal: the title
+   *  is best-effort and another poll will retry. */
   private async maybeUpdateSessionTitle(sessionId: string, session: Session): Promise<void> {
+    // The in-flight flag keeps a poll tick and the idle-time check from
+    // pushing the same title twice when they overlap.
+    if (session.titleLookupInFlight) {
+      return;
+    }
+    session.titleLookupInFlight = true;
     let info;
     try {
       info = await getSessionInfo(sessionId, { dir: session.cwd });
     } catch (error) {
       this.logger.error(`Session ${sessionId}: failed to read session info: ${error}`);
       return;
+    } finally {
+      session.titleLookupInFlight = false;
     }
-    // `customTitle` is a user-set `/rename`; `summary` is the auto-generated
-    // title (or first prompt). Prefer the explicit title when present.
-    const rawTitle = info?.customTitle ?? info?.summary;
+    // Only `customTitle` is trustworthy: the SDK fills it from an explicit
+    // title entry — a user `/rename` or its background-generated `aiTitle`.
+    // `summary` falls back to the LAST user prompt when no title entry
+    // exists, so pushing it names the session after throwaway follow-ups
+    // ("是") instead of the task.
+    const rawTitle = info?.customTitle;
     if (!rawTitle) {
       return;
     }
@@ -1475,6 +1509,7 @@ export class ClaudeAcpAgent {
       return;
     }
     session.lastTitle = title;
+    this.stopSessionTitlePolling(session);
     await this.client.sessionUpdate({
       sessionId,
       update: {
@@ -1483,6 +1518,30 @@ export class ClaudeAcpAgent {
         updatedAt: new Date(info!.lastModified).toISOString(),
       },
     });
+  }
+
+  /** Poll the SDK session file for a title while a turn is running. The SDK
+   *  generates its `aiTitle` in a background task at the START of turn one
+   *  and persists it long before `idle`, so waiting for turn-end needlessly
+   *  delays the title. No-op once a title has been pushed or a poll is
+   *  already running. */
+  private startSessionTitlePolling(sessionId: string, session: Session): void {
+    if (session.lastTitle || session.titlePollTimer) {
+      return;
+    }
+    void this.maybeUpdateSessionTitle(sessionId, session);
+    session.titlePollTimer = setInterval(() => {
+      void this.maybeUpdateSessionTitle(sessionId, session);
+    }, ClaudeAcpAgent.TITLE_POLL_INTERVAL_MS);
+    // The poll is pure bonus latency-wise; never keep the process alive for it.
+    session.titlePollTimer.unref();
+  }
+
+  private stopSessionTitlePolling(session: Session): void {
+    if (session.titlePollTimer) {
+      clearInterval(session.titlePollTimer);
+      session.titlePollTimer = undefined;
+    }
   }
 
   async authenticate(_params: AuthenticateRequest): Promise<void> {
@@ -2444,7 +2503,12 @@ export class ClaudeAcpAgent {
               }
               case "session_state_changed": {
                 session.lastSessionState = message.state;
-                if (message.state === "idle") {
+                if (message.state === "running") {
+                  // The SDK writes its background-generated title early in
+                  // the turn; poll for it so the client gets the real title
+                  // mid-turn instead of at turn-end.
+                  this.startSessionTitlePolling(params.sessionId, session);
+                } else if (message.state === "idle") {
                   // A non-cancelled turn normally settled at its terminal
                   // `result` already (issue #773), and that result recorded an
                   // owed trailing idle — absorbed here via the decrement. We
@@ -2530,10 +2594,10 @@ export class ClaudeAcpAgent {
                       ),
                     );
                   }
-                  // The SDK generates the session title in a background task and
-                  // persists it to the session file; `idle` is the turn-over
-                  // signal, so it's the point at which a new title may have
-                  // landed. Push it to the client if it changed.
+                  // Turn over: stop the mid-turn poll and do one final
+                  // title check — the SDK's background title task may have
+                  // landed only at the very end of the turn.
+                  this.stopSessionTitlePolling(session);
                   await this.maybeUpdateSessionTitle(params.sessionId, session);
                 }
                 break;
@@ -3928,6 +3992,7 @@ export class ClaudeAcpAgent {
     }
     session.queryClosed = true;
     session.consumer = undefined;
+    this.stopSessionTitlePolling(session);
     session.settingsManager.dispose();
     session.input.end();
     session.query.close();
@@ -4612,17 +4677,24 @@ export class ClaudeAcpAgent {
     };
   }
 
-  private async sendAvailableCommandsUpdate(sessionId: string): Promise<void> {
-    const session = this.sessions[sessionId];
-    if (!session) return;
-    const commands = await session.query.supportedCommands();
+  private async sendAvailableCommandsUpdate(
+    sessionId: string,
+    availableCommands?: AvailableCommand[],
+  ): Promise<void> {
+    const commands = availableCommands ?? (await this.getAvailableCommands(sessionId));
     await this.client.sessionUpdate({
       sessionId,
       update: {
         sessionUpdate: "available_commands_update",
-        availableCommands: getAvailableSlashCommands(commands),
+        availableCommands: commands,
       },
     });
+  }
+
+  private async getAvailableCommands(sessionId: string): Promise<AvailableCommand[]> {
+    const session = this.sessions[sessionId];
+    if (!session) return [];
+    return getAvailableSlashCommands(await session.query.supportedCommands());
   }
 
   private async updateConfigOption(
