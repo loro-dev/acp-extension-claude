@@ -2672,44 +2672,6 @@ describe("stop reason propagation", () => {
     });
   }
 
-  function taskStarted(taskId: string, description = "Explore repo") {
-    return {
-      type: "system",
-      subtype: "task_started",
-      task_id: taskId,
-      description,
-      uuid: randomUUID(),
-      session_id: "test-session",
-    };
-  }
-
-  function taskUpdated(taskId: string, status: "completed" | "failed" | "killed" = "completed") {
-    return {
-      type: "system",
-      subtype: "task_updated",
-      task_id: taskId,
-      patch: { status },
-      uuid: randomUUID(),
-      session_id: "test-session",
-    };
-  }
-
-  function taskNotification(
-    taskId: string,
-    status: "completed" | "failed" | "stopped" = "completed",
-  ) {
-    return {
-      type: "system",
-      subtype: "task_notification",
-      task_id: taskId,
-      status,
-      output_file: `/tmp/${taskId}.txt`,
-      summary: "done",
-      uuid: randomUUID(),
-      session_id: "test-session",
-    };
-  }
-
   it("should return max_tokens when success result has stop_reason max_tokens", async () => {
     const agent = createMockAgent();
     injectSession(agent, [
